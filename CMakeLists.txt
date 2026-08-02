@@ -1,11 +1,11 @@
 cmake_minimum_required(VERSION 3.12)
 
+# Set the target board BEFORE pulling in the SDK, so the SDK picks up the correct board
+set(PICO_BOARD pico2 CACHE STRING "Board type")
+
 # Pull in Raspberry Pi Pico SDK (must be before project)
 # pico_sdk_import.cmake auto-finds the SDK from the pico-sdk submodule
 include(pico_sdk_import.cmake)
-
-# Set the target board to Pico 2 (RP2350 ARM-S)
-set(PICO_BOARD pico2 CACHE STRING "Board type")
 
 project(pico2_freertos_template C CXX ASM)
 
