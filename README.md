@@ -96,11 +96,13 @@ screen /dev/tty.usbmodem* 115200
 ```
 pico2_freertos_template/
 ├── CMakeLists.txt                        # 顶层 CMake，定义 3 个编译目标
-├── hello_freertos.c                      # FreeRTOS 示例源码
+├── src/                                  # 用户应用代码
+│   └── hello_freertos.c                  #   FreeRTOS 示例源码
+├── cmake/                                # CMake 辅助脚本
+│   ├── pico_sdk_import.cmake             #   自动定位 pico-sdk submodule
+│   └── FreeRTOS_Kernel_import.cmake      #   自动定位 FreeRTOS-Kernel submodule
 ├── FreeRTOSConfig.h                      # FreeRTOS 配置入口
 ├── FreeRTOSConfig_examples_common.h      # 完整 FreeRTOS 配置参数
-├── FreeRTOS_Kernel_import.cmake          # 自动定位 FreeRTOS-Kernel submodule
-├── pico_sdk_import.cmake                 # 自动定位 pico-sdk submodule
 ├── .gitignore
 ├── pico-sdk/              (submodule)    # Raspberry Pi Pico SDK 2.3.0
 │   ├── lib/tinyusb/       (submodule)    #   USB 协议栈
@@ -123,9 +125,9 @@ pico2_freertos_template/
 
 ### 添加新的 FreeRTOS 任务
 
-1. 在 `hello_freertos.c` 中添加任务函数
+1. 在 `src/hello_freertos.c` 中添加任务函数
 2. 在 `vLaunch()` 中用 `xTaskCreate()` 创建任务
-3. 如需新的编译变体，在 `CMakeLists.txt` 中添加新的 `add_executable` 块
+3. 如需新的源文件，在 `CMakeLists.txt` 的 `add_executable` 中添加
 
 ### 指定 SDK 路径
 

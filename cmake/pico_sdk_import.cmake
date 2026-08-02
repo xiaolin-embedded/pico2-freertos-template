@@ -1,5 +1,6 @@
 # This is a copy of <PICO_SDK_PATH>/external/pico_sdk_import.cmake
 # Modified to auto-detect pico-sdk as a git submodule at <project_root>/pico-sdk
+# (this file lives in cmake/, so submodule is at ../pico-sdk)
 
 if (DEFINED ENV{PICO_SDK_PATH} AND (NOT PICO_SDK_PATH))
     set(PICO_SDK_PATH $ENV{PICO_SDK_PATH})
@@ -17,9 +18,9 @@ if (DEFINED ENV{PICO_SDK_FETCH_FROM_GIT_PATH} AND (NOT PICO_SDK_FETCH_FROM_GIT_P
 endif ()
 
 if (NOT PICO_SDK_PATH)
-    # Auto-detect pico-sdk as a git submodule at <project_root>/pico-sdk
-    if (EXISTS "${CMAKE_CURRENT_LIST_DIR}/pico-sdk")
-        set(PICO_SDK_PATH "${CMAKE_CURRENT_LIST_DIR}/pico-sdk")
+    # Auto-detect pico-sdk as a git submodule (this file is in cmake/, SDK is at ../pico-sdk)
+    if (EXISTS "${CMAKE_CURRENT_LIST_DIR}/../pico-sdk")
+        set(PICO_SDK_PATH "${CMAKE_CURRENT_LIST_DIR}/../pico-sdk")
         message("Using PICO_SDK_PATH from submodule ('${PICO_SDK_PATH}')")
     endif()
 endif()

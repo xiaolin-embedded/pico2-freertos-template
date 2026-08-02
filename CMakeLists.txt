@@ -5,7 +5,7 @@ set(PICO_BOARD pico2 CACHE STRING "Board type")
 
 # Pull in Raspberry Pi Pico SDK (must be before project)
 # pico_sdk_import.cmake auto-finds the SDK from the pico-sdk submodule
-include(pico_sdk_import.cmake)
+include(cmake/pico_sdk_import.cmake)
 
 project(pico2_freertos_template C CXX ASM)
 
@@ -19,13 +19,13 @@ endif()
 
 # Pull in FreeRTOS-Kernel (must be after pico_sdk_init)
 # FreeRTOS_Kernel_import.cmake auto-finds the kernel from the FreeRTOS-Kernel submodule
-include(FreeRTOS_Kernel_import.cmake)
+include(cmake/FreeRTOS_Kernel_import.cmake)
 
 # ============================================================================
 # hello_freertos_one_core — FreeRTOS on 1 core (dynamic heap)
 # ============================================================================
 add_executable(hello_freertos_one_core
-    hello_freertos.c
+    src/hello_freertos.c
 )
 target_include_directories(hello_freertos_one_core PRIVATE
     ${CMAKE_CURRENT_LIST_DIR}
@@ -44,7 +44,7 @@ pico_add_extra_outputs(hello_freertos_one_core)
 # hello_freertos_two_cores — FreeRTOS SMP on 2 cores (dynamic heap)
 # ============================================================================
 add_executable(hello_freertos_two_cores
-    hello_freertos.c
+    src/hello_freertos.c
 )
 target_include_directories(hello_freertos_two_cores PRIVATE
     ${CMAKE_CURRENT_LIST_DIR}
@@ -60,7 +60,7 @@ pico_add_extra_outputs(hello_freertos_two_cores)
 # hello_freertos_static_allocation — FreeRTOS SMP with static memory allocation
 # ============================================================================
 add_executable(hello_freertos_static_allocation
-    hello_freertos.c
+    src/hello_freertos.c
 )
 target_include_directories(hello_freertos_static_allocation PRIVATE
     ${CMAKE_CURRENT_LIST_DIR}
