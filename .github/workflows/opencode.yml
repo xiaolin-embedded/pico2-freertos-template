@@ -15,9 +15,8 @@ jobs:
       startsWith(github.event.comment.body, '/opencode')
     runs-on: ubuntu-latest
     permissions:
-      id-token: write
-      contents: read
-      pull-requests: read
+      contents: write
+      pull-requests: write
       issues: write
     steps:
       - name: Checkout repository
@@ -29,5 +28,7 @@ jobs:
         uses: anomalyco/opencode/github@latest
         env:
           DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           model: deepseek/deepseek-chat
+          use_github_token: true
