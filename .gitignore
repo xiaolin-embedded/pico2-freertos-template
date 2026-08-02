@@ -1,0 +1,14 @@
+# Build output
+build/
+
+# Generated binaries
+*.elf
+*.uf2
+*.bin
+*.hex
+*.dis
+*.elf.map
+
+# IDE
+.vscode/
+.idea/
