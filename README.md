@@ -1,26 +1,24 @@
 # Pico 2 FreeRTOS Template
 
-适用于 Raspberry Pi Pico 2 (RP2350 ARM-S) 的 FreeRTOS 模板工程，从 [pico-examples](https://github.com/raspberrypi/pico-examples) 提取。
+A FreeRTOS template project for Raspberry Pi Pico 2 (RP2350 ARM-S), extracted from [pico-examples](https://github.com/raspberrypi/pico-examples).
 
-## 工程简介
+## Overview
 
-本模板提供 3 个 FreeRTOS 编译变体，共享同一份源码 `hello_freertos.c`：
+This template provides a single FreeRTOS build target, with source code in `src/hello_freertos.c`:
 
-| 编译目标 | 说明 | FreeRTOS 内存管理 |
-|---------|------|-------------------|
-| `hello_freertos_one_core` | 单核 FreeRTOS | Heap-4 (动态) |
-| `hello_freertos_two_cores` | 双核 FreeRTOS SMP | Heap-4 (动态) |
-| `hello_freertos_static_allocation` | 双核 + 静态内存分配 | Static |
+| Build Target | Description | FreeRTOS Memory Management |
+|-------------|------|---------------------------|
+| `pico2-freertos-template` | Dual-core FreeRTOS SMP + static memory allocation | Static |
 
-程序运行后会：
-1. 创建 LED 闪烁任务（使用 Pico 2 板载 LED）
-2. 创建主任务循环打印 "Hello from main task count=N"
-3. 创建异步 worker 定时打印 "Hello from worker count=N"
-4. 在双核模式下显示每个任务运行在哪个核心
+The program will:
+1. Create an LED blinking task (using the Pico 2 on-board LED)
+2. Create a main task that prints "Hello from main task count=N" in a loop
+3. Create an async worker that periodically prints "Hello from worker count=N"
+4. Display which core each task is running on (in SMP mode)
 
-## 快速开始
+## Quick Start
 
-### 前置条件
+### Prerequisites
 
 ```bash
 # Ubuntu/Debian
@@ -30,40 +28,37 @@ sudo apt install cmake gcc-arm-none-eabi libnewlib-arm-none-eabi build-essential
 brew install cmake arm-none-eabi-gcc git
 ```
 
-### 克隆与编译
+### Clone and Build
 
 ```bash
-# 1. 克隆仓库（递归拉取所有 submodule）
+# 1. Clone the repository (recursively pull all submodules)
 git clone --recurse-submodules <your-repo-url>
-cd pico2_freertos_template
+cd pico2-freertos-template
 
-# 2. 如果是已克隆的仓库，需要初始化 submodule
+# 2. If the repository was already cloned, initialize submodules
 # git submodule update --init --recursive
 
-# 3. 编译
+# 3. Build
 mkdir build && cd build
 cmake ..
-make -j4                          # 编译所有 3 个目标
-
-# 或只编译特定目标
-make -j4 hello_freertos_two_cores
+make -j4
 ```
 
-### 烧录到 Pico 2
+### Flashing to Pico 2
 
-**方法一：UF2 拖拽**
-1. 按住 Pico 2 的 BOOTSEL 按钮
-2. 通过 USB 连接电脑
-3. 松开按钮，Pico 2 会以 U 盘形式出现
-4. 将 `build/hello_freertos_two_cores.uf2` 拖入 U 盘
+**Method 1: UF2 Drag-and-Drop**
+1. Hold down the BOOTSEL button on Pico 2
+2. Connect to the computer via USB
+3. Release the button; Pico 2 will appear as a USB drive
+4. Drag `build/pico2-freertos-template.uf2` onto the drive
 
-**方法二：picotool**
+**Method 2: picotool**
 ```bash
-picotool load build/hello_freertos_two_cores.uf2
+picotool load build/pico2-freertos-template.uf2
 picotool reboot
 ```
 
-### 查看串口输出
+### View Serial Output
 
 ```bash
 # Linux
@@ -72,72 +67,71 @@ screen /dev/ttyACM0 115200
 # macOS
 screen /dev/tty.usbmodem* 115200
 
-# 退出: Ctrl+A 然后 K 然后 Y
+# Exit: Ctrl+A then K then Y
 ```
 
-## 依赖说明
+## Dependencies
 
-本项目通过 git submodule 管理所有依赖，无需手动设置环境变量：
+This project manages all dependencies via git submodules — no environment variables needed:
 
-| 依赖 | 来源 | 版本 |
-|------|------|------|
+| Dependency | Source | Version |
+|-----------|------|---------|
 | [pico-sdk](https://github.com/raspberrypi/pico-sdk) | submodule `pico-sdk/` | 2.3.0 |
-| [FreeRTOS-Kernel](https://github.com/raspberrypi/FreeRTOS-Kernel) | submodule `FreeRTOS-Kernel/` | RP2350 端口支持 |
-| [tinyusb](https://github.com/hathach/tinyusb) | pico-sdk 子模块 | 0.18.0 |
-| [lwip](https://github.com/lwip-tcpip/lwip) | pico-sdk 子模块 | STABLE-2_2_1 |
-| [mbedtls](https://github.com/Mbed-TLS/mbedtls) | pico-sdk 子模块 | v3.6.6 |
-| [btstack](https://github.com/bluekitchen/btstack) | pico-sdk 子模块 | v1.8.2 |
-| [cyw43-driver](https://github.com/georgerobotics/cyw43-driver) | pico-sdk 子模块 | v1.1.1 |
+| [FreeRTOS-Kernel](https://github.com/raspberrypi/FreeRTOS-Kernel) | submodule `FreeRTOS-Kernel/` | RP2350 port support |
+| [tinyusb](https://github.com/hathach/tinyusb) | pico-sdk submodule | 0.18.0 |
+| [lwip](https://github.com/lwip-tcpip/lwip) | pico-sdk submodule | STABLE-2_2_1 |
+| [mbedtls](https://github.com/Mbed-TLS/mbedtls) | pico-sdk submodule | v3.6.6 |
+| [btstack](https://github.com/bluekitchen/btstack) | pico-sdk submodule | v1.8.2 |
+| [cyw43-driver](https://github.com/georgerobotics/cyw43-driver) | pico-sdk submodule | v1.1.1 |
 
-所有子模块通过 `git submodule update --init --recursive` 一次性拉取。
+All submodules are pulled at once with `git submodule update --init --recursive`.
 
-## 文件结构
+## File Structure
 
 ```
-pico2_freertos_template/
-├── CMakeLists.txt                        # 顶层 CMake，定义 3 个编译目标
-├── src/                                  # 用户应用代码
-│   └── hello_freertos.c                  #   FreeRTOS 示例源码
-├── cmake/                                # CMake 辅助脚本
-│   ├── pico_sdk_import.cmake             #   自动定位 pico-sdk submodule
-│   └── FreeRTOS_Kernel_import.cmake      #   自动定位 FreeRTOS-Kernel submodule
-├── FreeRTOSConfig.h                      # FreeRTOS 配置入口
-├── FreeRTOSConfig_examples_common.h      # 完整 FreeRTOS 配置参数
+pico2-freertos-template/
+├── CMakeLists.txt                        # Top-level CMake, defines the build target
+├── src/                                  # User application code
+│   └── hello_freertos.c                  #   FreeRTOS example source
+├── cmake/                                # CMake helper scripts
+│   ├── pico_sdk_import.cmake             #   Auto-locates pico-sdk submodule
+│   └── FreeRTOS_Kernel_import.cmake      #   Auto-locates FreeRTOS-Kernel submodule
+├── FreeRTOSConfig.h                      # FreeRTOS configuration entry point
+├── FreeRTOSConfig_examples_common.h      # Full FreeRTOS configuration parameters
 ├── .gitignore
 ├── pico-sdk/              (submodule)    # Raspberry Pi Pico SDK 2.3.0
-│   ├── lib/tinyusb/       (submodule)    #   USB 协议栈
-│   ├── lib/lwip/          (submodule)    #   TCP/IP 协议栈
-│   ├── lib/mbedtls/       (submodule)    #   TLS 加密库
-│   ├── lib/btstack/       (submodule)    #   蓝牙协议栈
-│   └── lib/cyw43-driver/  (submodule)    #   WiFi 芯片驱动
-└── FreeRTOS-Kernel/       (submodule)    # FreeRTOS 内核 (RP2350 端口)
+│   ├── lib/tinyusb/       (submodule)    #   USB stack
+│   ├── lib/lwip/          (submodule)    #   TCP/IP stack
+│   ├── lib/mbedtls/       (submodule)    #   TLS encryption library
+│   ├── lib/btstack/       (submodule)    #   Bluetooth stack
+│   └── lib/cyw43-driver/  (submodule)    #   WiFi chip driver
+└── FreeRTOS-Kernel/       (submodule)    # FreeRTOS kernel (RP2350 port)
 ```
 
-## 自定义指南
+## Customization Guide
 
-### 修改 FreeRTOS 配置
+### Modifying FreeRTOS Configuration
 
-编辑 `FreeRTOSConfig_examples_common.h`，可调整：
-- `configTICK_RATE_HZ` — 系统滴答频率 (默认 1000 Hz)
-- `configTOTAL_HEAP_SIZE` — 动态堆大小 (默认 128 KB)
-- `configMAX_PRIORITIES` — 最大任务优先级数
-- `configMINIMAL_STACK_SIZE` — 最小任务栈大小
+Edit `FreeRTOSConfig_examples_common.h` to adjust:
+- `configTICK_RATE_HZ` — System tick frequency (default 1000 Hz)
+- `configMAX_PRIORITIES` — Maximum number of task priorities
+- `configMINIMAL_STACK_SIZE` — Minimum task stack size
 
-### 添加新的 FreeRTOS 任务
+### Adding New FreeRTOS Tasks
 
-1. 在 `src/hello_freertos.c` 中添加任务函数
-2. 在 `vLaunch()` 中用 `xTaskCreate()` 创建任务
-3. 如需新的源文件，在 `CMakeLists.txt` 的 `add_executable` 中添加
+1. Add your task function in `src/hello_freertos.c`
+2. Create the task in `vLaunch()` using `xTaskCreateStatic()`
+3. If adding new source files, add them to `add_executable` in `CMakeLists.txt`
 
-### 指定 SDK 路径
+### Specifying SDK Path
 
-默认自动从 `pico-sdk/` submodule 定位。如需使用其他 SDK：
+By default, the SDK is auto-located from the `pico-sdk/` submodule. To use a different SDK:
 
 ```bash
 cmake .. -DPICO_SDK_PATH=/path/to/your/pico-sdk
 ```
 
-### 编译给其他 Pico 板子
+### Building for Other Pico Boards
 
 ```bash
 # Raspberry Pi Pico (RP2040)
@@ -147,13 +141,13 @@ cmake .. -DPICO_BOARD=pico
 cmake .. -DPICO_BOARD=pico2_w
 ```
 
-## 常见问题
+## FAQ
 
-**Q: cmake 报 "FreeRTOS location was not specified"**
-A: 确保 `git submodule update --init --recursive` 已执行，`FreeRTOS-Kernel/` 目录存在。
+**Q: cmake reports "FreeRTOS location was not specified"**
+A: Make sure `git submodule update --init --recursive` has been run, and the `FreeRTOS-Kernel/` directory exists.
 
-**Q: cmake 报 "PICO_SDK_PATH not found"**
-A: 确保 `git submodule update --init --recursive` 已执行，`pico-sdk/` 目录存在。或手动指定 `-DPICO_SDK_PATH=/path/to/pico-sdk`。
+**Q: cmake reports "PICO_SDK_PATH not found"**
+A: Make sure `git submodule update --init --recursive` has been run, and the `pico-sdk/` directory exists. Alternatively, manually specify `-DPICO_SDK_PATH=/path/to/pico-sdk`.
 
-**Q: 串口没有输出**
-A: 确认 Pico 2 通过 USB 连接到电脑，检查 `/dev/ttyACM0` 权限，或尝试 `sudo chmod 666 /dev/ttyACM0`。
+**Q: No serial output**
+A: Make sure Pico 2 is connected to the computer via USB, check `/dev/ttyACM0` permissions, or try `sudo chmod 666 /dev/ttyACM0`.
