@@ -45,12 +45,18 @@ target_include_directories(pico2-freertos-template PRIVATE
     ${CMAKE_CURRENT_LIST_DIR}
 )
 target_link_libraries(pico2-freertos-template PRIVATE
-    pico_async_context_freertos
     FreeRTOS-Kernel-Static
     pico_stdlib
+    hardware_spi
+    hardware_dma
 )
 target_compile_definitions(pico2-freertos-template PRIVATE
     configSUPPORT_STATIC_ALLOCATION=1
     configSUPPORT_DYNAMIC_ALLOCATION=0
+    # Larger CDC RX FIFO: the host preloads data faster than the SPI drain rate.
+    CFG_TUD_CDC_RX_BUFSIZE=8192
+    # Accept data from custom hosts that do not assert DTR.
+    PICO_STDIO_USB_CONNECTION_WITHOUT_DTR=1
 )
+pico_enable_stdio_usb(pico2-freertos-template 1)
 pico_add_extra_outputs(pico2-freertos-template)

@@ -1,6 +1,6 @@
 # AGENTS.md
 
-FreeRTOS template for Raspberry Pi Pico 2 (RP2350, ARM-S / Cortex-M33). Single build target `pico2-freertos-template`: dual-core FreeRTOS SMP with **static-only** memory allocation. See `README.md` for user-facing docs.
+FreeRTOS-based USB-to-SPI-slave bridge for Raspberry Pi Pico 2 (RP2350, ARM-S / Cortex-M33). Single build target `pico2-freertos-template`: dual-core FreeRTOS SMP with **static-only** memory allocation. See `README.md` for user-facing docs.
 
 ## Build & Flash
 
@@ -22,14 +22,19 @@ picotool load -fx build/pico2-freertos-template.uf2
 - Outputs via `pico_add_extra_outputs`: `.elf`, `.uf2`, `.bin`, `.hex`, `.dis`, `.elf.map`.
 - System `arm-none-eabi-gcc` (13.x) + cmake >= 3.12 + ninja/make is sufficient. The `~/.pico-sdk/` toolchain-manager (Ninja, GCC 15.2) is installed by the VS Code Pico extension and is **not** required — though the existing `build/` dir was configured that way (Ninja, Release).
 - Gotcha: if `PICO_SDK_PATH` is set in the environment, it **overrides** submodule auto-detection. The SDK version check requires >= 2.3.0 (`FATAL_ERROR` otherwise).
-- Root `pico_sdk_import.cmake` is gitignored (VS Code extension auto-generates it); the tracked copy is `cmake/pico_sdk_import.cmake`. README's file-tree still lists the root one — stale.
+- Root `pico_sdk_import.cmake` is gitignored (VS Code extension auto-generates it); the tracked copy is `cmake/pico_sdk_import.cmake`.
 
 ## Architecture
 
 - All app code lives in **`src/hello_freertos.c`** — a single translation unit. There is **no `include/` dir**; the repo root is the include path (that's how `FreeRTOSConfig.h` is found).
-- Startup chain: `main()` → `stdio_init_all()` (UART0/USB-CDC serial) → `vLaunch()` → `xTaskCreateStatic(MainThread)` → `vTaskStartScheduler()`.
-- `main_task` (MainThread, prio 2, pinned to core 1 in SMP) spawns `BlinkThread` (prio 1) and the SDK async-context worker task (prio 4, created inside `async_context_freertos_init()`).
-- Peripherals used: only stdio serial + on-board LED (GPIO 25 via `PICO_DEFAULT_LED_PIN`). A `pico2_w` build (`-DPICO_BOARD=pico2_w`) switches the LED to the cyw43 WiFi chip. No DMA/I2C/SPI/PWM/ADC/PIO.
+- **App is a USB CDC → SPI0 slave bridge.** External master reads 64 B every 1 ms (Mode 0, MSB first). Slave output (master MISO) = GP19/SPI0 TX, slave input (master MOSI) = GP16/SPI0 RX, CS = GP17, SCK = GP18. The peripheral's TX/RX directions do not flip with the bus role.
+- Startup chain: `main()` → `stdio_init_all()` → `bridge_hardware_init()` (SPI slave + DMA channel config, DMA **not** started) → banner `printf` → `vLaunch()` → tasks → `vTaskStartScheduler()`.
+- Tasks, all static: `UsbRx` (prio 4, core 0; parses framed USB protocol, writes 384 KiB SPSC ring), `SpiPump` (prio 6, core 1; 1 ms period, tracks DMA position, keeps an 8 KiB staging ring ≥512 B ahead, zero-fills on empty), `Blink` (prio 1, core 0; on-board LED).
+- Data path: USB ring (384 KiB, C11 atomics head/tail, non-power-of-two) → staging ring (8 KiB, power-of-two, size-aligned) → DMA endless mode (`dma_encode_endless_transfer_count()`, ring mode wraps read address) → SPI TX FIFO. The pump starts the DMA lazily on the first host data so the first frame is not preceded by zeros.
+- Link libs: `FreeRTOS-Kernel-Static`, `pico_stdlib`, `hardware_spi`, `hardware_dma`. USB stdio enabled via `pico_enable_stdio_usb`; `pico_async_context_freertos` is **not** used.
+- Build-time defines: `CFG_TUD_CDC_RX_BUFSIZE=8192`, `PICO_STDIO_USB_CONNECTION_WITHOUT_DTR=1`. RP2350-only (`#error` on RP2040).
+- Wire protocol (host tool: `tools/usb_loader.py`): `AA 55 | type | seq[2] | len[2] | payload | crc16[2]`, CRC-16/CCITT-FALSE over type..payload. WRITE=0x01 → ACK 0x81 (`accepted, used, free`); STATUS=0x02 → 0x82 (10 × u32 counters).
+- Peripherals used: USB CDC, SPI0 slave, one DMA channel, on-board LED (GPIO 25; `pico2_w` uses cyw43). No I2C/PWM/ADC/PIO.
 
 ## Conventions & constraints
 

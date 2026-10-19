@@ -1,153 +1,214 @@
-# Pico 2 FreeRTOS Template
+# Pico 2 USB → SPI Slave Bridge
 
-A FreeRTOS template project for Raspberry Pi Pico 2 (RP2350 ARM-S), extracted from [pico-examples](https://github.com/raspberrypi/pico-examples).
+RP2350 (Raspberry Pi Pico 2) firmware that turns the board into a **USB-to-SPI-slave
+data bridge**, built on FreeRTOS SMP with static-only memory allocation.
 
-## Overview
+- An external SPI master reads **64 bytes every 1 ms** (exactly **64,000 B/s**), SPI Mode 0, MSB first.
+- A host PC preloads data over USB CDC with a framed, CRC-protected, ACK-flow-controlled protocol.
+- A **384 KiB** main ring buffer caches preloaded data; an **8 KiB** staging ring feeds the SPI peripheral via DMA.
+- DMA runs in RP2350 **ENDLESS** transfer-count mode with address ring wrapping, so feeding the SPI TX FIFO costs no CPU time.
+- When no preloaded data is available, the bridge transmits zeros.
 
-This template provides a single FreeRTOS build target, with source code in `src/hello_freertos.c`:
+## Data Path
 
-| Build Target | Description | FreeRTOS Memory Management |
-|-------------|------|---------------------------|
-| `pico2-freertos-template` | Dual-core FreeRTOS SMP + static memory allocation | Static |
-
-The program will:
-1. Create an LED blinking task (using the Pico 2 on-board LED)
-2. Create a main task that prints "Hello from main task count=N" in a loop
-3. Create an async worker that periodically prints "Hello from worker count=N"
-4. Display which core each task is running on (in SMP mode)
-
-## Quick Start
-
-### Prerequisites
-
-```bash
-# Ubuntu/Debian
-sudo apt install cmake gcc-arm-none-eabi libnewlib-arm-none-eabi build-essential git
-
-# macOS
-brew install cmake arm-none-eabi-gcc git
+```
+Host PC ──USB CDC──> UsbRx task ──WRITE──> 384 KiB SPSC ring
+(core 0, prio 4)                              │
+                                              │ 1 ms pump (core 1, prio 6)
+                                              ▼
+                                       8 KiB staging ring
+                                              │
+                                   DMA ENDLESS + ring mode
+                                              │
+                                              ▼
+                                    SPI0 TX FIFO ──> external master
 ```
 
-### Clone and Build
+## Hardware
+
+| SPI signal | Pico 2 GPIO | Header pin | Direction |
+|------------|-------------|------------|-----------|
+| MISO       | GP19        | 25         | slave → master |
+| CS         | GP17        | 22         | master → slave |
+| GND        | GND         | 23         | common ground |
+| SCK        | GP18        | 24         | master → slave |
+| MOSI       | GP16        | 21         | master → slave (unused by the bridge) |
+
+- SPI0 in slave mode, Mode 0 (CPOL=0, CPHA=0), 8-bit frames, MSB first.
+- **3.3 V logic only.** Connect grounds together.
+- On RP2350 the SPI peripheral's TX pin is always the data output and RX always the data
+  input, regardless of the bus role. As a slave, **GP19 (SPI0 TX) drives the master's
+  MISO**, and **GP16 (SPI0 RX) receives the master's MOSI**.
+- CS has an internal pull-up and SCK a pull-down in Mode 0. The RX input is not used by
+  the bridge, but its FIFO is drained. The peripheral tristates its output when
+  deselected, so it is safe on a shared bus.
+
+## Build and Flash
+
+`pico-sdk/` and `FreeRTOS-Kernel/` are git submodules; no environment variables are required.
 
 ```bash
-# 1. Clone the repository (recursively pull all submodules)
-git clone --recurse-submodules <your-repo-url>
-cd pico2-freertos-template
-
-# 2. If the repository was already cloned, initialize submodules
-# git submodule update --init --recursive
-
-# 3. Build
-mkdir build && cd build
-cmake ..
-make -j4
+git submodule update --init --recursive
+cmake -S . -B build
+cmake --build build -j4
+picotool load -fx build/pico2-freertos-template.uf2
 ```
 
-### Flashing to Pico 2
+Requirements: Pico SDK >= 2.3.0, `arm-none-eabi-gcc`, CMake >= 3.12, and an **RP2350**
+board. The build intentionally fails on RP2040 (`#error`) because DMA endless mode is RP2350-only.
 
-**Method 1: UF2 Drag-and-Drop**
-1. Hold down the BOOTSEL button on Pico 2
-2. Connect to the computer via USB
-3. Release the button; Pico 2 will appear as a USB drive
-4. Drag `build/pico2-freertos-template.uf2` onto the drive
+## USB Protocol
 
-**Method 2: picotool**
+All multi-byte fields are little endian.
+
+```
+AA 55 | type(1) | seq(2) | len(2) | payload(len) | crc16(2)
+```
+
+- `crc16` is CRC-16/CCITT-FALSE: polynomial `0x1021`, init `0xFFFF`, no reflection.
+- CRC covers `type` through the end of `payload` (the 5 header bytes plus payload).
+- `seq` is echoed in the reply so late/stale replies can be discarded.
+
+### Commands
+
+| Type | Name | Payload | Reply |
+|------|------|---------|-------|
+| `0x01` | WRITE | 0–4096 data bytes, appended to the ring | `0x81` ACK |
+| `0x02` | STATUS | none | `0x82` STATUS |
+
+### ACK (`0x81`, 12-byte payload)
+
+| Offset | Type | Field |
+|--------|------|-------|
+| 0 | u32 | `accepted` — bytes actually queued (may be less than sent) |
+| 4 | u32 | `used` — bytes currently in the ring |
+| 8 | u32 | `free` — free space in the ring |
+
+A short accept means the ring is full: resend the remaining bytes later. The reference
+loader implements this flow control.
+
+### STATUS (`0x82`, 40-byte payload)
+
+| Field | Description |
+|-------|-------------|
+| `capacity` | Ring size (393216 bytes) |
+| `used`, `free` | Current ring occupancy |
+| `stage_ahead` | Bytes staged ahead of the DMA read position |
+| `spi_consumed` | Bytes fed into the SPI TX FIFO (includes FIFO lookahead) |
+| `zero_fill` | Bytes synthesized as zeros because the main ring was empty |
+| `crc_errors` | Frames dropped due to CRC mismatch |
+| `bad_frames` | Valid-CRC frames with an unknown type or oversized payload |
+| `underrun_events` | Pump fell behind the DMA |
+| `ring_full_events` | WRITE payloads that were only partially accepted |
+
+## Host Loader
+
+The repository includes `tools/usb_loader.py` (requires Python 3 and `pyserial`):
+
 ```bash
-picotool load build/pico2-freertos-template.uf2
-picotool reboot
+pip install pyserial
+
+# Bridge counters only
+python3 tools/usb_loader.py --status
+
+# Preload a file (auto-detects USB VID:PID 2e8a:0009)
+python3 tools/usb_loader.py data.bin
+
+# Explicit port; status is printed after loading anyway
+python3 tools/usb_loader.py -p /dev/ttyACM0 -s data.bin
+
+# Stream from stdin
+cat data.bin | python3 tools/usb_loader.py -
 ```
 
-### View Serial Output
+A dependency-free C++17 loader (Linux/POSIX, `termios` + `poll`) is also provided:
 
 ```bash
-# Linux
-screen /dev/ttyACM0 115200
-
-# macOS
-screen /dev/tty.usbmodem* 115200
-
-# Exit: Ctrl+A then K then Y
+g++ -std=c++17 -O2 -o usb_loader tools/usb_loader.cpp
+./usb_loader /dev/ttyACM0 --status
+./usb_loader /dev/ttyACM0 data.bin
 ```
 
-## Dependencies
+Data is **consumed**: each byte is sent to the master at most once. Loading the same file
+twice queues it twice. If the SPI master is not running, the ring fills up and the loader
+stops with a timeout after `--stall-timeout` seconds (default 10).
 
-This project manages all dependencies via git submodules — no environment variables needed:
+On Linux the port usually belongs to the `dialout` group:
 
-| Dependency | Source | Version |
-|-----------|------|---------|
-| [pico-sdk](https://github.com/raspberrypi/pico-sdk) | submodule `pico-sdk/` | 2.3.0 |
-| [FreeRTOS-Kernel](https://github.com/raspberrypi/FreeRTOS-Kernel) | submodule `FreeRTOS-Kernel/` | RP2350 port support |
-| [tinyusb](https://github.com/hathach/tinyusb) | pico-sdk submodule | 0.18.0 |
-| [lwip](https://github.com/lwip-tcpip/lwip) | pico-sdk submodule | STABLE-2_2_1 |
-| [mbedtls](https://github.com/Mbed-TLS/mbedtls) | pico-sdk submodule | v3.6.6 |
-| [btstack](https://github.com/bluekitchen/btstack) | pico-sdk submodule | v1.8.2 |
-| [cyw43-driver](https://github.com/georgerobotics/cyw43-driver) | pico-sdk submodule | v1.1.1 |
+```bash
+sudo usermod -aG dialout "$USER"   # log out and back in
+```
 
-All submodules are pulled at once with `git submodule update --init --recursive`.
+## Buffer and Real-Time Behavior
+
+- **384 KiB** holds exactly **6 seconds** of data at the 64,000 B/s drain rate.
+- The pump task runs every 1 ms on core 1 at priority 6 and keeps up to 512 bytes
+  (8 ms worth) staged ahead of the DMA. The USB task runs on core 0, so USB traffic
+  cannot delay the pump.
+- The DMA never stops: on an empty main ring the pump stages zeros, so the master always
+  clocks valid data. Because up to 512 bytes are staged ahead of the DMA, data loaded while
+  the master is idle can be preceded by up to 512 already-staged bytes (≈8 ms at the nominal rate).
+- Sustained preload throughput is limited by the master's drain rate once the ring is full.
+  A master that reads slower than 64,000 B/s will drain the ring proportionally slower.
+- The bridge is robust to USB disconnects: the partial frame parser resets on reconnect,
+  and buffered data survives.
+
+## Customization
+
+At the top of `src/hello_freertos.c`:
+
+- `BRIDGE_SPI`, `BRIDGE_PIN_TX`/`RX`/`CS`/`SCK`, `BRIDGE_SPI_CPOL`/`BRIDGE_SPI_CPHA` —
+  peripheral, pins, mode. `TX` is the slave output (master MISO) and `RX` the slave input.
+- `USB_RING_SIZE` — main ring size (default 384 KiB). Keep it smaller than the available RAM.
+- `STAGE_RING_BITS` — staging ring size (`1 << STAGE_RING_BITS` bytes). It must stay
+  power-of-two and is aligned to its size; the DMA ring limit is 32 KiB.
+- `STAGE_PREFETCH`, `PUMP_PERIOD_MS` — real-time tradeoff.
+
+FreeRTOS tunables live in `FreeRTOSConfig_examples_common.h`; the app uses static
+allocation only, so new tasks must use `xTaskCreateStatic()`.
+
+USB CDC options are set in `CMakeLists.txt`:
+
+- `CFG_TUD_CDC_RX_BUFSIZE=8192` — larger endpoint buffering for high-rate preloads.
+- `PICO_STDIO_USB_CONNECTION_WITHOUT_DTR=1` — accept hosts that do not assert DTR.
 
 ## File Structure
 
 ```
 pico2-freertos-template/
-├── CMakeLists.txt                        # Top-level CMake, defines the build target
-├── src/                                  # User application code
-│   └── hello_freertos.c                  #   FreeRTOS example source
-├── cmake/                                # CMake helper scripts
-│   ├── pico_sdk_import.cmake             #   Auto-locates pico-sdk submodule
-│   └── FreeRTOS_Kernel_import.cmake      #   Auto-locates FreeRTOS-Kernel submodule
+├── CMakeLists.txt                        # Build target, static allocation, stdio USB options
+├── src/hello_freertos.c                  # Bridge firmware (SPI slave, DMA, USB protocol, tasks)
+├── tools/usb_loader.py                   # Reference host loader / STATUS tool
+├── cmake/                                # SDK / FreeRTOS import helpers
 ├── FreeRTOSConfig.h                      # FreeRTOS configuration entry point
-├── FreeRTOSConfig_examples_common.h      # Full FreeRTOS configuration parameters
-├── .gitignore
+├── FreeRTOSConfig_examples_common.h      # Tunables
 ├── pico-sdk/              (submodule)    # Raspberry Pi Pico SDK 2.3.0
-│   ├── lib/tinyusb/       (submodule)    #   USB stack
-│   ├── lib/lwip/          (submodule)    #   TCP/IP stack
-│   ├── lib/mbedtls/       (submodule)    #   TLS encryption library
-│   ├── lib/btstack/       (submodule)    #   Bluetooth stack
-│   └── lib/cyw43-driver/  (submodule)    #   WiFi chip driver
-└── FreeRTOS-Kernel/       (submodule)    # FreeRTOS kernel (RP2350 port)
+└── FreeRTOS-Kernel/       (submodule)    # FreeRTOS kernel (RP2350 SMP port)
 ```
 
-## Customization Guide
+## Dependencies
 
-### Modifying FreeRTOS Configuration
-
-Edit `FreeRTOSConfig_examples_common.h` to adjust:
-- `configTICK_RATE_HZ` — System tick frequency (default 1000 Hz)
-- `configMAX_PRIORITIES` — Maximum number of task priorities
-- `configMINIMAL_STACK_SIZE` — Minimum task stack size
-
-### Adding New FreeRTOS Tasks
-
-1. Add your task function in `src/hello_freertos.c`
-2. Create the task in `vLaunch()` using `xTaskCreateStatic()`
-3. If adding new source files, add them to `add_executable` in `CMakeLists.txt`
-
-### Specifying SDK Path
-
-By default, the SDK is auto-located from the `pico-sdk/` submodule. To use a different SDK:
-
-```bash
-cmake .. -DPICO_SDK_PATH=/path/to/your/pico-sdk
-```
-
-### Building for Other Pico Boards
-
-```bash
-# Raspberry Pi Pico (RP2040)
-cmake .. -DPICO_BOARD=pico
-
-# Pico 2 W (RP2350 + WiFi)
-cmake .. -DPICO_BOARD=pico2_w
-```
+| Dependency | Source | Version |
+|-----------|--------|---------|
+| [pico-sdk](https://github.com/raspberrypi/pico-sdk) | submodule `pico-sdk/` | 2.3.0 |
+| [FreeRTOS-Kernel](https://github.com/raspberrypi/FreeRTOS-Kernel) | submodule `FreeRTOS-Kernel/` | RP2350 port support |
+| [tinyusb](https://github.com/hathach/tinyusb) | pico-sdk submodule | 0.18.0 |
+| [pyserial](https://pyserial.readthedocs.io/) | host, pip | for `tools/usb_loader.py` |
 
 ## FAQ
 
-**Q: cmake reports "FreeRTOS location was not specified"**
-A: Make sure `git submodule update --init --recursive` has been run, and the `FreeRTOS-Kernel/` directory exists.
+**Q: `usb_loader.py` cannot find the device**
+A: Pass `--port` explicitly and check `lsusb` for `2e8a:0009`. On Linux, make sure your
+user is in the `dialout` group (`/dev/ttyACM0` permissions).
 
-**Q: cmake reports "PICO_SDK_PATH not found"**
-A: Make sure `git submodule update --init --recursive` has been run, and the `pico-sdk/` directory exists. Alternatively, manually specify `-DPICO_SDK_PATH=/path/to/pico-sdk`.
+**Q: The loader times out with "ring stayed full"**
+A: The SPI master is not clocking data out, so the 384 KiB ring cannot drain. Verify SCK,
+CS, common ground, and Mode 0 on the master.
 
-**Q: No serial output**
-A: Make sure Pico 2 is connected to the computer via USB, check `/dev/ttyACM0` permissions, or try `sudo chmod 666 /dev/ttyACM0`.
+**Q: `underrun_events` or `zero_fill` keeps increasing**
+A: The host is not supplying data fast enough. Check the loader's progress output and USB
+connection. `zero_fill` alone is expected whenever the ring runs empty.
+
+**Q: Building for RP2040 fails**
+A: This bridge uses RP2350 DMA endless mode. Use a Pico 2 / Pico 2 W (`PICO_BOARD=pico2`
+or `pico2_w`).
