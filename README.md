@@ -157,7 +157,7 @@ WRITE_DATA rules:
 | `0x0203` | `ERR_OFFSET` | stream offset mismatch |
 | `0xFFFF` | `ERR_UNEXPECT` | unexpected error |
 
-## Host Loader
+## Host Stream Tool
 
 The repository includes `tools/usb_stream.py` (requires Python 3 and `pyserial`):
 
@@ -172,21 +172,49 @@ python3 tools/usb_stream.py --clear-counters
 # Preload a file (auto-detects USB VID:PID 2e8a:0009)
 # By default the loader continues at the device's stream_accepted (append).
 python3 tools/usb_stream.py data.bin
-python3 tools/usb_stream.py -p /dev/ttyACM0 --start-offset 0 data.bin
+python3 tools/usb_stream.py -p /dev/ttyACM1 --start-offset 0 data.bin
 
 # Stream from stdin
 cat data.bin | python3 tools/usb_stream.py -
 ```
 
-A dependency-free C++17 loader (Linux/POSIX, `termios` + `poll`) is also provided:
+A dependency-free C++17 stream tool (Linux/POSIX, `termios` + `poll`) is also provided:
 
 ```bash
 g++ -std=c++17 -O2 -Wall -Wextra -Werror -o usb_stream tools/usb_stream.cpp
-./usb_stream /dev/ttyACM0 --status
-./usb_stream /dev/ttyACM0 --version
-./usb_stream /dev/ttyACM0 data.bin
-cat data.bin | ./usb_stream /dev/ttyACM0 -
+./usb_stream /dev/ttyACM1 --status
+./usb_stream /dev/ttyACM1 --version
+./usb_stream /dev/ttyACM1 data.bin
+cat data.bin | ./usb_stream /dev/ttyACM1 -
 ```
+
+**Port selection:** the Python tool auto-detects VID:PID `2e8a:0009` and uses
+the first match. If the board enumerates as `/dev/ttyACM1`, or several CDC
+devices are present, pass `-p /dev/ttyACM1`. The C++ tool always takes the port
+as its first argument.
+
+### Test pattern
+
+Both tools can generate a test stream instead of reading a file. Frame index N
+(starts at 0) is 64 bytes, all filled with byte `N & 0xFF`: the first frame is
+`0x00`, frame index 255 is `0xFF`, and index 256 wraps to `0x00` again. Without
+`--frames` the pattern runs until Ctrl-C; `--frames N` stops after N frames.
+
+```bash
+# Endless pattern on /dev/ttyACM1
+python3 tools/usb_stream.py -p /dev/ttyACM1 --pattern --start-offset 0
+
+# 260 frames: covers 0x00..0xFF and the wrap back to 0x00
+python3 tools/usb_stream.py -p /dev/ttyACM1 --pattern --frames 260 --start-offset 0
+./usb_stream /dev/ttyACM1 --pattern --frames 260 --start-offset 0
+```
+
+Each SPI 64-byte read should contain 64 copies of the same value; the next
+frame is the next value. The tool batches frames into USB WRITE payloads
+(default 960 B = 15 frames); add `--chunk 64` if you want one 64-byte frame
+per WRITE. Use a freshly reset MCU (or `--start-offset 0`) for a deterministic
+first frame; otherwise the pattern is appended after existing data. `--pattern`
+cannot be combined with a file.
 
 Files are sent in **64-byte frames**; a trailing partial frame is padded with
 zero bytes and reported with a warning. WRITE payloads are at most 960 bytes

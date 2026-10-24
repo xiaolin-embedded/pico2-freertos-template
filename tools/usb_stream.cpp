@@ -462,13 +462,44 @@ void print_status(const Bridge::Status &s) {
               << "stream_offset     " << s.stream_offset << "\n";
 }
 
+// Frame index N (starts at 0) is 64 copies of byte (N & 0xFF); 256 frames per cycle.
+void write_pattern(Bridge &bridge, size_t chunk, uint64_t frames) {
+    const size_t per_chunk = chunk / kFrameBytes;
+    uint64_t frame = 0;
+    uint64_t last_report = 0;
+    std::vector<uint8_t> block;
+
+    while (frames == 0 || frame < frames) {
+        size_t count = per_chunk;
+        if (frames != 0 && frames - frame < count) {
+            count = static_cast<size_t>(frames - frame);
+        }
+        block.resize(count * kFrameBytes);
+        for (size_t i = 0; i < count; ++i) {
+            const uint8_t value =
+                static_cast<uint8_t>((frame + i) & 0xFF);
+            std::fill_n(block.begin() + static_cast<long>(i * kFrameBytes),
+                        kFrameBytes, value);
+        }
+        bridge.write_data(block.data(), block.size(), chunk);
+        frame += count;
+        if (frame - last_report >= 1024 ||
+            (frames != 0 && frame == frames)) {
+            std::cerr << "\r" << frame << " frames sent" << std::flush;
+            last_report = frame;
+        }
+    }
+    std::cerr << "\n";
+}
+
 }  // namespace
 
 int main(int argc, char **argv) {
     if (argc < 2) {
         std::cerr << "usage: " << argv[0]
-                  << " <port> [file | --status] [--version]"
-                     " [--clear-counters] [--chunk N] [--start-offset N]\n";
+                  << " <port> [file | --pattern] [--status] [--version]"
+                     " [--clear-counters] [--chunk N] [--start-offset N]"
+                     " [--frames N]\n";
         return 2;
     }
 
@@ -477,6 +508,9 @@ int main(int argc, char **argv) {
         bool status_only = false;
         bool show_version = false;
         bool clear_counters = false;
+        bool pattern = false;
+        bool frames_set = false;
+        uint64_t frames = 0;
         std::string file;
         size_t chunk = kWriteMaxData;
         bool have_start_offset = false;
@@ -490,6 +524,15 @@ int main(int argc, char **argv) {
                 show_version = true;
             } else if (arg == "--clear-counters") {
                 clear_counters = true;
+            } else if (arg == "--pattern") {
+                pattern = true;
+            } else if (arg == "--frames" && i + 1 < argc) {
+                const long long value = std::stoll(argv[++i]);
+                if (value < 0) {
+                    throw std::runtime_error("--frames must be >= 0");
+                }
+                frames = static_cast<uint64_t>(value);
+                frames_set = true;
             } else if (arg == "--chunk" && i + 1 < argc) {
                 chunk = std::stoul(argv[++i]);
             } else if (arg == "--start-offset" && i + 1 < argc) {
@@ -508,6 +551,12 @@ int main(int argc, char **argv) {
             throw std::runtime_error(
                 "--chunk must be 64..960 and a multiple of 64");
         }
+        if (frames_set && !pattern) {
+            throw std::runtime_error("--frames requires --pattern");
+        }
+        if (pattern && !file.empty()) {
+            throw std::runtime_error("--pattern does not take a file");
+        }
 
         if (show_version) {
             const Bridge::Version v = bridge.version();
@@ -524,7 +573,7 @@ int main(int argc, char **argv) {
         }
 
         Bridge::Status status = bridge.status();
-        if (status_only || file.empty()) {
+        if (status_only || (file.empty() && !pattern)) {
             print_status(status);
             return 0;
         }
@@ -534,6 +583,12 @@ int main(int argc, char **argv) {
         std::cerr << "device stream offset 0x" << std::hex
                   << bridge.offset() << std::dec << ", ring " << status.free
                   << " free\n";
+
+        if (pattern) {
+            write_pattern(bridge, chunk, frames);
+            print_status(bridge.status());
+            return 0;
+        }
 
         std::ifstream file_in;
         std::istream *in = &std::cin;

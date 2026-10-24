@@ -342,9 +342,30 @@ def load_stdin(bridge, chunk):
         bridge.write_data(pending, chunk=chunk)
 
 
+def load_pattern(bridge, frames, chunk):
+    """Send 64-byte frames; frame N is filled with byte (N & 0xFF)."""
+    per_chunk = chunk // FRAME_BYTES
+    frame = 0
+    last_report = 0
+    if frames == 0:
+        print("sending endless pattern; Ctrl-C to stop", file=sys.stderr)
+    while frames == 0 or frame < frames:
+        count = per_chunk if frames == 0 else min(per_chunk, frames - frame)
+        block = bytearray(count * FRAME_BYTES)
+        for i in range(count):
+            value = (frame + i) & 0xFF
+            block[i * FRAME_BYTES:(i + 1) * FRAME_BYTES] = bytes([value]) * FRAME_BYTES
+        bridge.write_data(bytes(block), chunk=chunk)
+        frame += count
+        if frame - last_report >= 1024 or (frames != 0 and frame == frames):
+            print("\r%u frames sent" % frame, end="", file=sys.stderr, flush=True)
+            last_report = frame
+    print(file=sys.stderr)
+
+
 def main():
     parser = argparse.ArgumentParser(
-        description="Load data into the Pico 2 USB-to-SPI bridge")
+        description="Load data or a test pattern into the Pico 2 USB-to-SPI bridge")
     parser.add_argument("file", nargs="?",
                         help="binary file to preload, or '-' for stdin")
     parser.add_argument("-p", "--port",
@@ -353,6 +374,10 @@ def main():
                         help="ignored by USB CDC (default: 115200)")
     parser.add_argument("-c", "--chunk", type=int, default=WRITE_MAX_DATA,
                         help="WRITE payload bytes, multiple of 64, max 960")
+    parser.add_argument("--pattern", action="store_true",
+                        help="send test frames: frame index N (from 0) is 64 x (N & 0xFF)")
+    parser.add_argument("--frames", type=int, default=None,
+                        help="number of frames for --pattern (0 = endless)")
     parser.add_argument("-s", "--status", action="store_true",
                         help="print device status and exit")
     parser.add_argument("--version", action="store_true",
@@ -371,8 +396,16 @@ def main():
     if (args.chunk < FRAME_BYTES or args.chunk > WRITE_MAX_DATA or
             args.chunk % FRAME_BYTES):
         parser.error("--chunk must be 64..960 and a multiple of 64")
+    if args.frames is not None and not args.pattern:
+        parser.error("--frames requires --pattern")
+    if args.frames is not None and args.frames < 0:
+        parser.error("--frames must be >= 0")
+    if args.pattern and args.file:
+        parser.error("--pattern does not take a file")
 
     port = args.port or find_port()
+    if args.port is None:
+        print("using %s" % port, file=sys.stderr)
     bridge = Bridge(port, args.baud, stall_timeout=args.stall_timeout,
                     retries=args.retries)
     try:
@@ -387,7 +420,7 @@ def main():
             print("counters cleared")
 
         status = bridge.status()
-        if args.status or not args.file:
+        if args.status or (not args.file and not args.pattern):
             print_status(status)
             return
 
@@ -396,7 +429,10 @@ def main():
         print("device stream offset 0x%08X, ring %u free" %
               (bridge.offset, status["free"]), file=sys.stderr)
 
-        if args.file == "-":
+        if args.pattern:
+            load_pattern(bridge, 0 if args.frames is None else args.frames,
+                         args.chunk)
+        elif args.file == "-":
             load_stdin(bridge, args.chunk)
         else:
             load_file(bridge, args.file, args.chunk)

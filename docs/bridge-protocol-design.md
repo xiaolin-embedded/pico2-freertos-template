@@ -318,7 +318,17 @@ for each block of data (length multiple of 64, <= 960):
 - 默认从设备 `stream_accepted` 继续（追加）；要从 0 重新开始，需要复位 MCU，或明确知道设备位置时用 `--start-offset`。
 - 消费型数据不可回放；没有 flush/seek 命令。
 
-### 9.3 健康检查
+### 9.3 内置测试图样
+
+两个参考工具都支持 `--pattern`：帧索引 N（从 0 开始）是 64 字节，全部填充 `N & 0xFF`；第 1 帧（N=0）为 `0x00`，第 256 帧（N=255）为 `0xFF`，第 257 帧（N=256）回到 `0x00`。
+
+- `--frames N` 限制帧数；省略表示一直发送到 Ctrl-C。
+- 上位机默认按 960 B（15 帧）一个 WRITE；帧边界由设备的 64 字节对齐保证，SPI master 每次读到的 64 字节应全部相同。若希望一帧一个 WRITE，加 `--chunk 64`。
+- 使用前最好复位 MCU，或用 `--start-offset 0` 确认设备从 0 开始；否则图样会追加在已有数据之后。
+- 260 帧可以覆盖 `0x00..0xFF` 以及 `0xFF → 0x00` 的回绕。
+- 端口：Python 用 `-p /dev/ttyACM1`，C++ 把端口作为第一个参数。
+
+### 9.4 健康检查
 
 - `checksum_errors`、`bad_packets` 应保持 0。
 - `stream_offset` 应保持 0。
@@ -359,6 +369,7 @@ for each block of data (length multiple of 64, <= 960):
 4. 暂停 master，确认 WRITE 返回 `ERR_RING_FULL` 且主机能续传。
 5. 人为制造 ACK 丢失/重发，确认设备不重复入队（offset 机制）。
 6. 用逻辑分析仪确认 CS 拉低期间 MISO 连续输出 64 字节，且 Mode 1 时序正确。
+7. 用 `--pattern --frames 260` 检查每帧 64 字节内容、帧值递增和 `0xFF → 0x00` 回绕。
 
 ## 12. 参考代码
 
