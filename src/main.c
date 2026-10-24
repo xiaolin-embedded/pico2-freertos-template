@@ -5,18 +5,18 @@
  *
  * USB CDC -> SPI slave bridge for RP2350.
  *
- * Wire protocol (USB CDC, little endian):
- *   AA 55 | type | seq[2] | len[2] | payload[len] | crc16[2]
- *   crc16 is CCITT-FALSE (poly 0x1021, init 0xFFFF) over type..payload.
+ * Packet format (compact framing with an additive checksum):
+ *   0xAA | chksum | len_lo | len_hi | payload[len] | 0x55
+ *   chksum makes the 8-bit sum of the complete packet zero. The length is
+ *   16-bit so one packet can carry several 64-byte frames.
  *
- * Host -> device:
- *   0x01 WRITE   payload is appended to the big ring buffer.
- *   0x02 STATUS  request counters/levels.
- *
- * Device -> host:
- *   0x81 ACK     u32 accepted, u32 used, u32 free
- *   0x82 STATUS  u32 capacity, used, free, stage_ahead, spi_consumed,
- *                zero_fill, crc_errors, bad_frames, underrun_events, ring_full
+ * Commands (payload[0], payload[1] reserved in requests):
+ *   0x01 WRITE_DATA  seq[2], offset[4], data[N]  (N % 64 == 0, N <= 960)
+ *   0x02 GET_STATUS  no arguments
+ *   0x03 CLEAR_COUNTERS
+ *   0x04 GET_VERSION
+ * Responses set payload[1] to STATUS_*; WRITE_DATA reports accepted bytes
+ * and the device stream offset so a retry after a lost ACK is idempotent.
  */
 
 #include <stdatomic.h>
@@ -24,6 +24,8 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
+
+#include "bridge_protocol.h"
 
 #include "pico/stdlib.h"
 #include "hardware/dma.h"
@@ -67,12 +69,14 @@
 #ifndef BRIDGE_SPI_CPOL
 #define BRIDGE_SPI_CPOL     SPI_CPOL_0
 #endif
+// PL022 freezes the slave shift register while CS is low when SPH=0, so a
+// master that holds CS low for a 64-byte transaction needs Mode 1.
 #ifndef BRIDGE_SPI_CPHA
-#define BRIDGE_SPI_CPHA     SPI_CPHA_0
+#define BRIDGE_SPI_CPHA     SPI_CPHA_1
 #endif
 
 // ---------------------------------------------------------------------------
-// Buffer sizing
+// Buffer and protocol sizing
 // ---------------------------------------------------------------------------
 
 // Data preloaded by the host, drained by the SPI master at 1 kHz * 64 B.
@@ -83,14 +87,8 @@
 #define STAGE_RING_SIZE     (1u << STAGE_RING_BITS)
 #define STAGE_PREFETCH      512u
 
-#define FRAME_MAX_PAYLOAD   4096u
 #define USB_CHUNK_SIZE      1024u
 #define USB_DRAIN_CHUNKS    8
-
-#define CMD_WRITE           0x01u
-#define CMD_STATUS          0x02u
-#define RSP_ACK             0x81u
-#define RSP_STATUS          0x82u
 
 // ---------------------------------------------------------------------------
 // Task configuration
@@ -100,22 +98,29 @@
 #define PUMP_TASK_PRIORITY      (tskIDLE_PRIORITY + 6UL)
 #define BLINK_TASK_PRIORITY     (tskIDLE_PRIORITY + 1UL)
 
+// Core 0 runs the whole bridge (USB + SPI pump); core 1 only blinks the LED.
 #define USB_TASK_CORE           0
-#define PUMP_TASK_CORE          1
-#define BLINK_TASK_CORE         0
+#define PUMP_TASK_CORE          0
+#define BLINK_TASK_CORE         1
 
 #define USB_TASK_STACK_SIZE     1024
 #define PUMP_TASK_STACK_SIZE    512
 #define BLINK_TASK_STACK_SIZE   512
 
 #define PUMP_PERIOD_MS          1
-#define BLINK_PERIOD_MS         2000
+// Toggle the status LED every 500 ms (1 Hz square wave).
+#define BLINK_PERIOD_MS         500
 
 #ifndef USE_LED
 #define USE_LED                 1
 #endif
 
 _Static_assert((STAGE_RING_SIZE & (STAGE_RING_SIZE - 1u)) == 0, "stage ring must be power of two");
+_Static_assert((USB_RING_SIZE % BRIDGE_FRAME_BYTES) == 0, "main ring must be frame aligned");
+_Static_assert((STAGE_RING_SIZE % BRIDGE_FRAME_BYTES) == 0, "stage ring must be frame aligned");
+_Static_assert((STAGE_PREFETCH % BRIDGE_FRAME_BYTES) == 0, "prefetch must be frame aligned");
+_Static_assert((BRIDGE_WRITE_MAX_DATA % BRIDGE_FRAME_BYTES) == 0, "write payload must stay frame aligned");
+_Static_assert(BRIDGE_PACKET_MAX_PAYLOAD >= BRIDGE_WRITE_HEADER_SIZE + BRIDGE_WRITE_MAX_DATA, "packet buffer too small");
 
 // ---------------------------------------------------------------------------
 // State
@@ -127,9 +132,11 @@ static uint8_t usb_ring[USB_RING_SIZE];
 // so the buffer must be aligned to its size.
 static uint8_t stage_ring[STAGE_RING_SIZE] __attribute__((aligned(STAGE_RING_SIZE)));
 
-static uint8_t frame_buf[FRAME_MAX_PAYLOAD];
 static uint8_t usb_chunk[USB_CHUNK_SIZE];
 static uint8_t pump_chunk[256];
+
+// Static protocol instance (the payload buffer is its largest member).
+static bridge_protocol_t protocol;
 
 // Single producer (USB task) / single consumer (pump task) indices. The totals
 // are monotonic and always interpreted as 32-bit differences.
@@ -143,37 +150,12 @@ static volatile uint32_t stage_ahead_bytes;
 static volatile uint32_t spi_consumed_bytes;
 static volatile uint32_t zero_fill_bytes;
 static volatile uint32_t underrun_events;
-static volatile uint32_t crc_errors;
-static volatile uint32_t bad_frames;
-static volatile uint32_t ring_full_events;
 
 static uint dma_channel;
 
 // ---------------------------------------------------------------------------
-// CRC16-CCITT-FALSE
-// ---------------------------------------------------------------------------
-
-static const uint16_t crc16_tab[16] = {
-    0x0000, 0x1021, 0x2042, 0x3063, 0x4084, 0x50A5, 0x60C6, 0x70E7,
-    0x8108, 0x9129, 0xA14A, 0xB16B, 0xC18C, 0xD1AD, 0xE1CE, 0xF1EF,
-};
-
-static inline uint16_t crc16_byte(uint16_t crc, uint8_t byte) {
-    crc = (uint16_t)((crc << 4) ^ crc16_tab[((crc >> 12) ^ (byte >> 4)) & 0x0F]);
-    crc = (uint16_t)((crc << 4) ^ crc16_tab[((crc >> 12) ^ (byte & 0x0F)) & 0x0F]);
-    return crc;
-}
-
-// ---------------------------------------------------------------------------
 // Large ring buffer (USB producer -> pump consumer)
 // ---------------------------------------------------------------------------
-
-static inline void put_u32(uint8_t *p, uint32_t value) {
-    p[0] = (uint8_t)value;
-    p[1] = (uint8_t)(value >> 8);
-    p[2] = (uint8_t)(value >> 16);
-    p[3] = (uint8_t)(value >> 24);
-}
 
 static size_t usb_ring_write(const uint8_t *src, size_t len) {
     uint32_t head = atomic_load_explicit(&ring_head, memory_order_relaxed);
@@ -236,6 +218,39 @@ static bool usb_ring_has_data(void) {
 }
 
 // ---------------------------------------------------------------------------
+// Protocol callbacks (the wire protocol lives in bridge_protocol.c)
+// ---------------------------------------------------------------------------
+
+static void protocol_send(const uint8_t *data, size_t len) {
+    stdio_usb.out_chars((const char *)data, (int)len);
+}
+
+static size_t protocol_write(const uint8_t *data, size_t len) {
+    return usb_ring_write(data, len);
+}
+
+static void protocol_get_app_stats(bridge_app_stats_t *stats) {
+    usb_ring_stats(&stats->used, &stats->free_bytes);
+    stats->capacity = USB_RING_SIZE;
+    stats->stage_ahead = stage_ahead_bytes;
+    stats->spi_consumed = spi_consumed_bytes;
+    stats->zero_fill = zero_fill_bytes;
+    stats->underrun_events = underrun_events;
+}
+
+static void protocol_clear_app_counters(void) {
+    zero_fill_bytes = 0;
+    underrun_events = 0;
+}
+
+static const bridge_protocol_ops_t protocol_ops = {
+    .send = protocol_send,
+    .write = protocol_write,
+    .get_app_stats = protocol_get_app_stats,
+    .clear_app_counters = protocol_clear_app_counters,
+};
+
+// ---------------------------------------------------------------------------
 // Staging ring (pump producer -> DMA consumer)
 // ---------------------------------------------------------------------------
 
@@ -252,184 +267,6 @@ static void stage_write(const uint8_t *src, size_t len) {
 }
 
 // ---------------------------------------------------------------------------
-// USB frame parser
-// ---------------------------------------------------------------------------
-
-typedef enum {
-    PARSE_MAGIC0,
-    PARSE_MAGIC1,
-    PARSE_HEADER,
-    PARSE_PAYLOAD,
-    PARSE_CRC_LO,
-    PARSE_CRC_HI,
-    PARSE_DISCARD,
-} parse_state_t;
-
-static struct {
-    parse_state_t state;
-    uint8_t header[5];
-    uint32_t header_pos;
-    uint8_t type;
-    uint16_t seq;
-    uint16_t payload_len;
-    uint32_t payload_pos;
-    uint16_t crc;
-    uint16_t crc_rx;
-    uint32_t discard_left;
-} parser;
-
-static void parser_reset(void) {
-    memset(&parser, 0, sizeof(parser));
-    parser.state = PARSE_MAGIC0;
-}
-
-static void send_frame(uint8_t type, uint16_t seq, const uint8_t *payload, size_t len) {
-    uint8_t out[9 + 40];
-    if (len > 40) {
-        return;
-    }
-
-    out[0] = 0xAA;
-    out[1] = 0x55;
-    out[2] = type;
-    out[3] = (uint8_t)seq;
-    out[4] = (uint8_t)(seq >> 8);
-    out[5] = (uint8_t)len;
-    out[6] = (uint8_t)(len >> 8);
-    if (len) {
-        memcpy(&out[7], payload, len);
-    }
-
-    uint16_t crc = 0xFFFF;
-    for (size_t i = 2; i < 7 + len; i++) {
-        crc = crc16_byte(crc, out[i]);
-    }
-    out[7 + len] = (uint8_t)crc;
-    out[8 + len] = (uint8_t)(crc >> 8);
-
-    stdio_usb.out_chars((const char *)out, (int)(9 + len));
-}
-
-static void handle_write(uint16_t seq, const uint8_t *data, size_t len) {
-    size_t accepted = usb_ring_write(data, len);
-    if (accepted != len) {
-        ring_full_events++;
-    }
-
-    uint32_t used, free_bytes;
-    usb_ring_stats(&used, &free_bytes);
-
-    uint8_t payload[12];
-    put_u32(&payload[0], (uint32_t)accepted);
-    put_u32(&payload[4], used);
-    put_u32(&payload[8], free_bytes);
-    send_frame(RSP_ACK, seq, payload, sizeof(payload));
-}
-
-static void handle_status(uint16_t seq) {
-    uint32_t used, free_bytes;
-    usb_ring_stats(&used, &free_bytes);
-
-    uint8_t payload[40];
-    put_u32(&payload[0], USB_RING_SIZE);
-    put_u32(&payload[4], used);
-    put_u32(&payload[8], free_bytes);
-    put_u32(&payload[12], stage_ahead_bytes);
-    put_u32(&payload[16], spi_consumed_bytes);
-    put_u32(&payload[20], zero_fill_bytes);
-    put_u32(&payload[24], crc_errors);
-    put_u32(&payload[28], bad_frames);
-    put_u32(&payload[32], underrun_events);
-    put_u32(&payload[36], ring_full_events);
-    send_frame(RSP_STATUS, seq, payload, sizeof(payload));
-}
-
-static void dispatch_frame(uint8_t type, uint16_t seq, const uint8_t *payload, size_t len) {
-    switch (type) {
-    case CMD_WRITE:
-        handle_write(seq, payload, len);
-        break;
-    case CMD_STATUS:
-        handle_status(seq);
-        break;
-    default:
-        bad_frames++;
-        break;
-    }
-}
-
-static void parser_feed(const uint8_t *data, size_t len) {
-    for (size_t i = 0; i < len; i++) {
-        uint8_t byte = data[i];
-
-        switch (parser.state) {
-        case PARSE_MAGIC0:
-            if (byte == 0xAA) {
-                parser.state = PARSE_MAGIC1;
-            }
-            break;
-
-        case PARSE_MAGIC1:
-            if (byte == 0x55) {
-                parser.state = PARSE_HEADER;
-                parser.header_pos = 0;
-                parser.crc = 0xFFFF;
-            } else if (byte != 0xAA) {
-                parser.state = PARSE_MAGIC0;
-            }
-            break;
-
-        case PARSE_HEADER:
-            parser.header[parser.header_pos++] = byte;
-            parser.crc = crc16_byte(parser.crc, byte);
-            if (parser.header_pos == sizeof(parser.header)) {
-                parser.type = parser.header[0];
-                parser.seq = (uint16_t)(parser.header[1] | (parser.header[2] << 8));
-                parser.payload_len = (uint16_t)(parser.header[3] | (parser.header[4] << 8));
-                parser.payload_pos = 0;
-                if (parser.payload_len > FRAME_MAX_PAYLOAD) {
-                    bad_frames++;
-                    parser.discard_left = (uint32_t)parser.payload_len + 2;
-                    parser.state = PARSE_DISCARD;
-                } else {
-                    parser.state = parser.payload_len ? PARSE_PAYLOAD : PARSE_CRC_LO;
-                }
-            }
-            break;
-
-        case PARSE_PAYLOAD:
-            frame_buf[parser.payload_pos++] = byte;
-            parser.crc = crc16_byte(parser.crc, byte);
-            if (parser.payload_pos == parser.payload_len) {
-                parser.state = PARSE_CRC_LO;
-            }
-            break;
-
-        case PARSE_CRC_LO:
-            parser.crc_rx = byte;
-            parser.state = PARSE_CRC_HI;
-            break;
-
-        case PARSE_CRC_HI:
-            parser.crc_rx |= (uint16_t)(byte << 8);
-            if (parser.crc_rx == parser.crc) {
-                dispatch_frame(parser.type, parser.seq, frame_buf, parser.payload_len);
-            } else {
-                crc_errors++;
-            }
-            parser.state = PARSE_MAGIC0;
-            break;
-
-        case PARSE_DISCARD:
-            if (--parser.discard_left == 0) {
-                parser.state = PARSE_MAGIC0;
-            }
-            break;
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
 // Tasks
 // ---------------------------------------------------------------------------
 
@@ -440,7 +277,7 @@ static void usb_rx_task(__unused void *params) {
     for (;;) {
         bool connected = stdio_usb_connected();
         if (connected && !was_connected) {
-            parser_reset();
+            bridge_protocol_reset_parser(&protocol);
         }
         was_connected = connected;
 
@@ -449,7 +286,7 @@ static void usb_rx_task(__unused void *params) {
             if (count <= 0) {
                 break;
             }
-            parser_feed(usb_chunk, (size_t)count);
+            bridge_protocol_feed(&protocol, usb_chunk, (size_t)count);
         }
 
         vTaskDelayUntil(&last_wake, pdMS_TO_TICKS(1));
@@ -483,7 +320,12 @@ static void spi_pump_task(__unused void *params) {
         bool has_data = usb_ring_has_data();
         if (dma_started) {
             if ((uint32_t)ahead < STAGE_PREFETCH) {
-                uint32_t fill = STAGE_PREFETCH - (uint32_t)ahead;
+                // The DMA read cursor advances one byte at a time, so `ahead`
+                // is not frame aligned. Round the refill down: the main-ring
+                // tail must only move in whole 64-byte frames, otherwise a
+                // partial WRITE accept could split a frame.
+                uint32_t fill = (STAGE_PREFETCH - (uint32_t)ahead) &
+                                ~(BRIDGE_FRAME_BYTES - 1u);
                 while (fill) {
                     size_t chunk = fill > sizeof(pump_chunk) ? sizeof(pump_chunk) : fill;
                     size_t got = usb_ring_read(pump_chunk, chunk);
@@ -646,12 +488,15 @@ void vLaunch(void) {
 int main(void) {
     stdio_init_all();
     bridge_hardware_init();
+    bridge_protocol_init(&protocol, &protocol_ops);
 
     printf("USB-SPI bridge ready: %u KiB ring, SPI0 slave mode %d, "
-           "MISO=%d CS=%d SCK=%d MOSI=%d\n",
+           "MISO=%d CS=%d SCK=%d MOSI=%d, protocol %u.%u\n",
            USB_RING_SIZE / 1024u,
-           (BRIDGE_SPI_CPOL == SPI_CPOL_0 && BRIDGE_SPI_CPHA == SPI_CPHA_0) ? 0 : 3,
-           BRIDGE_PIN_TX, BRIDGE_PIN_CS, BRIDGE_PIN_SCK, BRIDGE_PIN_RX);
+           (BRIDGE_SPI_CPOL == SPI_CPOL_1 ? 2 : 0) +
+               (BRIDGE_SPI_CPHA == SPI_CPHA_1 ? 1 : 0),
+           BRIDGE_PIN_TX, BRIDGE_PIN_CS, BRIDGE_PIN_SCK, BRIDGE_PIN_RX,
+           BRIDGE_PROTOCOL_VERSION_MAJOR, BRIDGE_PROTOCOL_VERSION_MINOR);
 
     vLaunch();
     return 0;

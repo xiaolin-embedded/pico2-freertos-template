@@ -1,7 +1,12 @@
 // C++17 host loader for the RP2350 USB -> SPI-slave bridge (Linux/POSIX).
-// Build: g++ -std=c++17 -O2 -Wall -Wextra -o usb_bridge_loader usb_bridge_loader.cpp
-// Usage: ./usb_bridge_loader /dev/ttyACM0 data.bin
-//        ./usb_bridge_loader /dev/ttyACM0 --status
+//
+// Packet format:
+//   0xAA | chksum | len_lo | len_hi | payload[len] | 0x55
+// chksum makes the 8-bit sum of the complete packet zero.
+//
+// Build: g++ -std=c++17 -O2 -Wall -Wextra -Werror -o usb_loader usb_loader.cpp
+// Usage: ./usb_loader /dev/ttyACM0 data.bin
+//        ./usb_loader /dev/ttyACM0 --status
 
 #include <algorithm>
 #include <array>
@@ -25,29 +30,35 @@ namespace {
 
 using Clock = std::chrono::steady_clock;
 
-constexpr uint8_t kMagic0 = 0xAA;
-constexpr uint8_t kMagic1 = 0x55;
+constexpr uint8_t kHead = 0xAA;
+constexpr uint8_t kRear = 0x55;
+constexpr size_t kMaxPacket = 1024;
+constexpr size_t kMaxPayload = kMaxPacket - 5;
+constexpr size_t kFrameBytes = 64;
+constexpr size_t kWriteMaxData = 15 * kFrameBytes;
+constexpr size_t kWriteHeader = 8;
+
 constexpr uint8_t kCmdWrite = 0x01;
 constexpr uint8_t kCmdStatus = 0x02;
-constexpr uint8_t kRspAck = 0x81;
-constexpr uint8_t kRspStatus = 0x82;
-constexpr size_t kMaxPayload = 4096;
-constexpr size_t kRecord = 64;          // one SPI transaction
-constexpr size_t kDefaultChunk = 4096;  // 64 records
+constexpr uint8_t kCmdClearCounters = 0x03;
+constexpr uint8_t kCmdVersion = 0x04;
 
-uint16_t crc16_update(uint16_t crc, const uint8_t *p, size_t n) {
-    for (size_t i = 0; i < n; ++i) {
-        crc ^= static_cast<uint16_t>(p[i]) << 8;
-        for (int b = 0; b < 8; ++b) {
-            crc = (crc & 0x8000) ? static_cast<uint16_t>((crc << 1) ^ 0x1021)
-                                 : static_cast<uint16_t>(crc << 1);
-        }
-    }
-    return crc;
-}
+constexpr uint8_t kStatusSuccess = 0x01;
+constexpr uint8_t kStatusError = 0x03;
 
-uint16_t crc16_ccitt(const uint8_t *p, size_t n) {
-    return crc16_update(0xFFFF, p, n);
+constexpr uint16_t kErrSuccess = 0x0000;
+constexpr uint16_t kErrInvalidLength = 0x0101;
+constexpr uint16_t kErrUnsupported = 0x0104;
+constexpr uint16_t kErrRingFull = 0x0201;
+constexpr uint16_t kErrNotAligned = 0x0202;
+constexpr uint16_t kErrOffset = 0x0203;
+
+struct TimeoutError : std::runtime_error {
+    using std::runtime_error::runtime_error;
+};
+
+uint16_t le16(const uint8_t *p) {
+    return static_cast<uint16_t>(p[0] | (p[1] << 8));
 }
 
 uint32_t le32(const uint8_t *p) {
@@ -55,6 +66,49 @@ uint32_t le32(const uint8_t *p) {
            (static_cast<uint32_t>(p[1]) << 8) |
            (static_cast<uint32_t>(p[2]) << 16) |
            (static_cast<uint32_t>(p[3]) << 24);
+}
+
+void put16(std::vector<uint8_t> &v, uint16_t value) {
+    v.push_back(static_cast<uint8_t>(value));
+    v.push_back(static_cast<uint8_t>(value >> 8));
+}
+
+void put32(std::vector<uint8_t> &v, uint32_t value) {
+    v.push_back(static_cast<uint8_t>(value));
+    v.push_back(static_cast<uint8_t>(value >> 8));
+    v.push_back(static_cast<uint8_t>(value >> 16));
+    v.push_back(static_cast<uint8_t>(value >> 24));
+}
+
+std::vector<uint8_t> make_packet(const std::vector<uint8_t> &payload) {
+    if (payload.size() > kMaxPayload) {
+        throw std::invalid_argument("payload too large");
+    }
+    std::vector<uint8_t> p;
+    p.reserve(payload.size() + 5);
+    p.push_back(kHead);
+    p.push_back(0);
+    put16(p, static_cast<uint16_t>(payload.size()));
+    p.insert(p.end(), payload.begin(), payload.end());
+    p.push_back(kRear);
+    uint8_t sum = 0;
+    for (uint8_t b : p) {
+        sum = static_cast<uint8_t>(sum + b);
+    }
+    p[1] = static_cast<uint8_t>(0u - sum);
+    return p;
+}
+
+const char *err_name(uint16_t err) {
+    switch (err) {
+    case kErrSuccess: return "success";
+    case kErrInvalidLength: return "invalid length";
+    case kErrUnsupported: return "unsupported command";
+    case kErrRingFull: return "ring full";
+    case kErrNotAligned: return "write not 64-byte aligned";
+    case kErrOffset: return "stream offset mismatch";
+    default: return "error";
+    }
 }
 
 int open_port(const std::string &path) {
@@ -73,7 +127,8 @@ int open_port(const std::string &path) {
     tio.c_cflag &= ~CRTSCTS;
     tio.c_cc[VMIN] = 0;
     tio.c_cc[VTIME] = 0;
-    ::cfsetispeed(&tio, B115200);  // ignored by CDC ACM
+    // CDC ACM ignores this line-coding value; termios requires a valid speed.
+    ::cfsetispeed(&tio, B115200);
     ::cfsetospeed(&tio, B115200);
     if (::tcsetattr(fd, TCSANOW, &tio) != 0) {
         int err = errno;
@@ -86,7 +141,10 @@ int open_port(const std::string &path) {
 
 class Bridge {
 public:
-    explicit Bridge(const std::string &path) : fd_(open_port(path)) {}
+    explicit Bridge(const std::string &path, int timeout_ms = 2000,
+                    int stall_ms = 10000, int retries = 5)
+        : fd_(open_port(path)), timeout_ms_(timeout_ms), stall_ms_(stall_ms),
+          retries_(retries) {}
 
     ~Bridge() {
         if (fd_ >= 0) {
@@ -97,199 +155,258 @@ public:
     Bridge(const Bridge &) = delete;
     Bridge &operator=(const Bridge &) = delete;
 
-    struct Ack {
-        uint32_t accepted;
-        uint32_t used;
-        uint32_t free;
-    };
-
     struct Status {
-        uint32_t capacity;
-        uint32_t used;
-        uint32_t free;
-        uint32_t stage_ahead;
-        uint32_t spi_consumed;
-        uint32_t zero_fill;
-        uint32_t crc_errors;
-        uint32_t bad_frames;
-        uint32_t underrun_events;
-        uint32_t ring_full_events;
+        uint32_t capacity, used, free, stage_ahead, spi_consumed;
+        uint32_t zero_fill, checksum_errors, bad_packets, ring_full_events;
+        uint32_t underrun_events, packets_ok, stream_accepted, stream_offset;
     };
 
-    Ack write_chunk(const uint8_t *data, size_t len) {
-        std::vector<uint8_t> p = transact(kCmdWrite, data, len, kRspAck);
-        if (p.size() != 12) {
-            throw std::runtime_error("bad ACK length");
-        }
-        return {le32(&p[0]), le32(&p[4]), le32(&p[8])};
-    }
+    struct Version {
+        uint8_t protocol_major, protocol_minor, fw_major, fw_minor;
+    };
+
+    void set_offset(uint32_t offset) { offset_ = offset; }
+    uint32_t offset() const { return offset_; }
 
     Status status() {
-        std::vector<uint8_t> p = transact(kCmdStatus, nullptr, 0, kRspStatus);
-        if (p.size() != 40) {
-            throw std::runtime_error("bad STATUS length");
+        std::vector<uint8_t> p = transact({kCmdStatus, 0}, kCmdStatus);
+        if (p.size() != 54 || p[1] != kStatusSuccess) {
+            throw std::runtime_error("bad GET_STATUS response");
         }
-        return {le32(&p[0]),  le32(&p[4]),  le32(&p[8]),  le32(&p[12]),
-                le32(&p[16]), le32(&p[20]), le32(&p[24]), le32(&p[28]),
-                le32(&p[32]), le32(&p[36])};
+        const uint8_t *d = p.data() + 2;
+        return {le32(d + 0),  le32(d + 4),  le32(d + 8),  le32(d + 12),
+                le32(d + 16), le32(d + 20), le32(d + 24), le32(d + 28),
+                le32(d + 32), le32(d + 36), le32(d + 40), le32(d + 44),
+                le32(d + 48)};
     }
 
-    // Push exactly len bytes. len must be a multiple of 64 so that every
-    // 64-byte SPI transaction stays aligned across zero-fill underruns.
-    void write_stream(const uint8_t *data, size_t len, size_t chunk,
-                      int stall_ms = 10000) {
-        if (len % kRecord != 0) {
+    Version version() {
+        std::vector<uint8_t> p = transact({kCmdVersion, 0}, kCmdVersion);
+        if (p.size() != 6 || p[1] != kStatusSuccess) {
+            throw std::runtime_error("bad GET_VERSION response");
+        }
+        return {p[2], p[3], p[4], p[5]};
+    }
+
+    void clear_counters() {
+        std::vector<uint8_t> p =
+            transact({kCmdClearCounters, 0}, kCmdClearCounters);
+        if (p.size() != 2 || p[1] != kStatusSuccess) {
+            throw std::runtime_error("bad CLEAR_COUNTERS response");
+        }
+    }
+
+    // Push a buffer whose size is a multiple of 64. Retries partial writes
+    // and timeout retries; the stream offset makes a retry idempotent.
+    void write_data(const uint8_t *data, size_t len, size_t chunk) {
+        if (len % kFrameBytes != 0) {
             throw std::invalid_argument("length must be a multiple of 64");
         }
-        if (chunk == 0 || chunk > kMaxPayload || chunk % kRecord != 0) {
-            throw std::invalid_argument("chunk must be 64..4096, multiple of 64");
+        if (chunk < kFrameBytes || chunk > kWriteMaxData ||
+            chunk % kFrameBytes != 0) {
+            throw std::invalid_argument("chunk must be 64..960");
         }
-        size_t off = 0;
+
+        size_t pos = 0;
         auto last_progress = Clock::now();
-        while (off < len) {
-            const size_t n = std::min(chunk, len - off);
-            const Ack a = write_chunk(data + off, n);
-            if (a.accepted > n) {
+        int retries = 0;
+
+        while (pos < len) {
+            const size_t piece_len = std::min(chunk, len - pos);
+            WriteRsp rsp;
+            try {
+                rsp = write_chunk(offset_, data + pos, piece_len);
+            } catch (const TimeoutError &) {
+                if (++retries > retries_) {
+                    throw;
+                }
+                continue;
+            }
+            retries = 0;
+            if (rsp.accepted > piece_len) {
                 throw std::runtime_error("device accepted more than sent");
             }
-            off += a.accepted;
-            if (a.accepted > 0) {
+
+            if (rsp.err == kErrSuccess) {
+                if (rsp.accepted != piece_len) {
+                    throw std::runtime_error("short write without error");
+                }
+                offset_ += rsp.accepted;
+                pos += rsp.accepted;
                 last_progress = Clock::now();
-            }
-            if (a.accepted < n) {
-                // Ring full: the SPI master paces consumption. Retry the tail.
+            } else if (rsp.err == kErrRingFull) {
+                offset_ += rsp.accepted;
+                pos += rsp.accepted;
+                if (rsp.accepted > 0) {
+                    last_progress = Clock::now();
+                }
                 if (Clock::now() - last_progress >
-                    std::chrono::milliseconds(stall_ms)) {
-                    throw std::runtime_error(
-                        "ring stalled (is the SPI master clocking?)");
+                    std::chrono::milliseconds(stall_ms_)) {
+                    throw TimeoutError(
+                        "ring stalled; is the SPI master clocking?");
                 }
                 std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            } else if (rsp.err == kErrOffset) {
+                const uint32_t delta = rsp.stream_accepted - offset_;
+                if (delta == 0) {
+                    if (Clock::now() - last_progress >
+                        std::chrono::milliseconds(stall_ms_)) {
+                        throw TimeoutError(
+                            "ring stalled; is the SPI master clocking?");
+                    }
+                    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                } else if (delta <= piece_len) {
+                    // A timed-out request was (partly) queued already.
+                    offset_ = rsp.stream_accepted;
+                    pos += delta;
+                    last_progress = Clock::now();
+                } else {
+                    throw std::runtime_error(
+                        "device offset does not match the host");
+                }
+            } else {
+                throw std::runtime_error(
+                    std::string("WRITE failed: ") + err_name(rsp.err) +
+                    " (accepted " + std::to_string(rsp.accepted) + ")");
             }
         }
     }
 
 private:
-    struct Frame {
-        uint8_t type = 0;
-        uint16_t seq = 0;
-        std::vector<uint8_t> payload;
+    struct WriteRsp {
+        uint16_t accepted = 0;
+        uint32_t stream_accepted = 0;
+        uint16_t err = 0xFFFF;
     };
 
-    std::vector<uint8_t> transact(uint8_t type, const uint8_t *data, size_t len,
+    std::vector<uint8_t> transact(const std::vector<uint8_t> &payload,
                                   uint8_t expect) {
-        const uint16_t seq = ++seq_;
-        send_frame(type, seq, data, len);
-        auto deadline = Clock::now() + std::chrono::milliseconds(2000);
-        Frame f;
-        while (read_frame(f, deadline)) {
-            if (f.type == expect && f.seq == seq) {
-                return std::move(f.payload);
+        const std::vector<uint8_t> packet = make_packet(payload);
+        write_all(packet.data(), packet.size());
+
+        const auto deadline =
+            Clock::now() + std::chrono::milliseconds(timeout_ms_);
+        std::vector<uint8_t> response;
+        while (true) {
+            if (!read_packet(response, deadline)) {
+                throw TimeoutError("no response for command");
+            }
+            if (!response.empty() && response[0] == expect) {
+                return response;
             }
         }
-        throw std::runtime_error("timeout waiting for response");
     }
 
-    void send_frame(uint8_t type, uint16_t seq, const uint8_t *data, size_t len) {
-        std::vector<uint8_t> f;
-        f.reserve(9 + len);
-        f.push_back(kMagic0);
-        f.push_back(kMagic1);
-        f.push_back(type);
-        f.push_back(static_cast<uint8_t>(seq));
-        f.push_back(static_cast<uint8_t>(seq >> 8));
-        f.push_back(static_cast<uint8_t>(len));
-        f.push_back(static_cast<uint8_t>(len >> 8));
-        if (len > 0) {
-            f.insert(f.end(), data, data + len);
-        }
-        const uint16_t crc = crc16_ccitt(f.data() + 2, 5 + len);
-        f.push_back(static_cast<uint8_t>(crc));
-        f.push_back(static_cast<uint8_t>(crc >> 8));
-        write_all(f.data(), f.size());
-    }
+    WriteRsp write_chunk(uint32_t offset, const uint8_t *data, size_t len) {
+        const uint16_t seq = seq_++;
+        std::vector<uint8_t> payload;
+        payload.reserve(8 + len);
+        payload.push_back(kCmdWrite);
+        payload.push_back(0);
+        put16(payload, seq);
+        put32(payload, offset);
+        payload.insert(payload.end(), data, data + len);
 
-    bool read_frame(Frame &f, Clock::time_point deadline) {
-        int state = 0;
-        for (;;) {  // resynchronise on AA 55
-            uint8_t b;
-            if (!read_exact(&b, 1, deadline)) {
-                return false;
-            }
-            if (state == 0) {
-                state = (b == kMagic0) ? 1 : 0;
-            } else if (b == kMagic1) {
-                break;
+        const std::vector<uint8_t> p =
+            transact(payload, kCmdWrite);
+        if (p.size() != 20 || p[1] != kStatusSuccess) {
+            if (p.size() == 20 && p[1] == kStatusError) {
+                // Report the error below.
             } else {
-                state = (b == kMagic0) ? 1 : 0;
+                throw std::runtime_error("bad WRITE_DATA response");
             }
         }
-        uint8_t hdr[5];
-        if (!read_exact(hdr, sizeof hdr, deadline)) {
-            return false;
+
+        WriteRsp rsp;
+        rsp.accepted = le16(&p[8]);
+        rsp.stream_accepted = le32(&p[10]);
+        rsp.err = static_cast<uint16_t>((p[18] << 8) | p[19]);
+        const uint16_t rsp_seq = le16(&p[2]);
+        const uint32_t rsp_offset = le32(&p[4]);
+        if (rsp_seq != seq || rsp_offset != offset) {
+            throw std::runtime_error("WRITE_DATA response mismatch");
         }
-        const uint8_t type = hdr[0];
-        const uint16_t seq = static_cast<uint16_t>(hdr[1] | (hdr[2] << 8));
-        const uint16_t len = static_cast<uint16_t>(hdr[3] | (hdr[4] << 8));
-        if (len > kMaxPayload) {
-            return false;  // desynchronised; caller will time out
-        }
-        std::vector<uint8_t> payload(len);
-        if (len > 0 && !read_exact(payload.data(), len, deadline)) {
-            return false;
-        }
-        uint8_t crcb[2];
-        if (!read_exact(crcb, sizeof crcb, deadline)) {
-            return false;
-        }
-        uint16_t crc = crc16_update(0xFFFF, hdr, sizeof hdr);
-        crc = crc16_update(crc, payload.data(), payload.size());
-        if (crc != static_cast<uint16_t>(crcb[0] | (crcb[1] << 8))) {
-            return false;
-        }
-        f.type = type;
-        f.seq = seq;
-        f.payload = std::move(payload);
-        return true;
+        return rsp;
     }
 
-    bool read_exact(void *dst, size_t len, Clock::time_point deadline) {
-        auto *p = static_cast<uint8_t *>(dst);
-        size_t got = 0;
-        while (got < len) {
-            const auto now = Clock::now();
-            if (now >= deadline) {
-                return false;
+    bool read_packet(std::vector<uint8_t> &payload,
+                     Clock::time_point deadline) {
+        while (true) {
+            size_t start = 0;
+            while (start < rx_.size() && rx_[start] != kHead) {
+                ++start;
             }
-            const auto left = std::chrono::duration_cast<std::chrono::milliseconds>(
-                deadline - now);
-            pollfd pfd{fd_, POLLIN, 0};
-            const int rc = ::poll(&pfd, 1, static_cast<int>(left.count()));
-            if (rc < 0) {
-                if (errno == EINTR) {
+            if (start > 0) {
+                rx_.erase(rx_.begin(), rx_.begin() + static_cast<long>(start));
+            }
+
+            if (rx_.size() >= 5) {
+                const size_t len = static_cast<size_t>(rx_[2]) |
+                                   (static_cast<size_t>(rx_[3]) << 8);
+                if (len > kMaxPayload) {
+                    rx_.erase(rx_.begin());
                     continue;
                 }
-                throw std::runtime_error(std::string("poll: ") +
-                                         std::strerror(errno));
-            }
-            if (rc == 0) {
-                return false;
-            }
-            if (pfd.revents & (POLLERR | POLLHUP | POLLNVAL)) {
-                throw std::runtime_error("USB device disconnected");
-            }
-            const ssize_t n = ::read(fd_, p + got, len - got);
-            if (n < 0) {
-                if (errno == EINTR || errno == EAGAIN) {
+                const size_t total = len + 5;
+                if (rx_.size() >= total) {
+                    uint8_t sum = 0;
+                    for (size_t i = 0; i < total; ++i) {
+                        sum = static_cast<uint8_t>(sum + rx_[i]);
+                    }
+                    if (rx_[total - 1] == kRear && sum == 0) {
+                        payload.assign(rx_.begin() + 4,
+                                       rx_.begin() + 4 +
+                                           static_cast<long>(len));
+                        rx_.erase(rx_.begin(),
+                                  rx_.begin() + static_cast<long>(total));
+                        return true;
+                    }
+                    rx_.erase(rx_.begin());
                     continue;
                 }
-                throw std::runtime_error(std::string("read: ") +
-                                         std::strerror(errno));
             }
-            if (n == 0) {
-                throw std::runtime_error("USB device disconnected");
+
+            if (!fill(deadline)) {
+                return false;
             }
-            got += static_cast<size_t>(n);
         }
+    }
+
+    bool fill(Clock::time_point deadline) {
+        const auto now = Clock::now();
+        if (now >= deadline) {
+            return false;
+        }
+        const auto left = std::chrono::duration_cast<std::chrono::milliseconds>(
+            deadline - now);
+        pollfd pfd{fd_, POLLIN, 0};
+        const int rc = ::poll(&pfd, 1, static_cast<int>(left.count()));
+        if (rc < 0) {
+            if (errno == EINTR) {
+                return true;
+            }
+            throw std::runtime_error(std::string("poll: ") +
+                                     std::strerror(errno));
+        }
+        if (rc == 0) {
+            return false;
+        }
+        if (pfd.revents & (POLLERR | POLLHUP | POLLNVAL)) {
+            throw std::runtime_error("USB device disconnected");
+        }
+        uint8_t temp[256];
+        const ssize_t n = ::read(fd_, temp, sizeof temp);
+        if (n < 0) {
+            if (errno == EINTR || errno == EAGAIN) {
+                return true;
+            }
+            throw std::runtime_error(std::string("read: ") +
+                                     std::strerror(errno));
+        }
+        if (n == 0) {
+            throw std::runtime_error("USB device disconnected");
+        }
+        rx_.insert(rx_.end(), temp, temp + n);
         return true;
     }
 
@@ -306,7 +423,7 @@ private:
                                          std::strerror(errno));
             }
             if (rc == 0) {
-                throw std::runtime_error("USB write timeout");
+                throw TimeoutError("USB write timeout");
             }
             const ssize_t n = ::write(fd_, p + sent, len - sent);
             if (n < 0) {
@@ -321,20 +438,28 @@ private:
     }
 
     int fd_;
+    int timeout_ms_;
+    int stall_ms_;
+    int retries_;
     uint16_t seq_ = 0;
+    uint32_t offset_ = 0;
+    std::vector<uint8_t> rx_;
 };
 
 void print_status(const Bridge::Status &s) {
-    std::cout << "capacity        " << s.capacity << "\n"
-              << "used            " << s.used << "\n"
-              << "free            " << s.free << "\n"
-              << "stage_ahead     " << s.stage_ahead << "\n"
-              << "spi_consumed    " << s.spi_consumed << "\n"
-              << "zero_fill       " << s.zero_fill << "\n"
-              << "crc_errors      " << s.crc_errors << "\n"
-              << "bad_frames      " << s.bad_frames << "\n"
-              << "underrun_events " << s.underrun_events << "\n"
-              << "ring_full       " << s.ring_full_events << "\n";
+    std::cout << "capacity          " << s.capacity << "\n"
+              << "used              " << s.used << "\n"
+              << "free              " << s.free << "\n"
+              << "stage_ahead       " << s.stage_ahead << "\n"
+              << "spi_consumed      " << s.spi_consumed << "\n"
+              << "zero_fill         " << s.zero_fill << "\n"
+              << "checksum_errors   " << s.checksum_errors << "\n"
+              << "bad_packets       " << s.bad_packets << "\n"
+              << "ring_full_events  " << s.ring_full_events << "\n"
+              << "underrun_events   " << s.underrun_events << "\n"
+              << "packets_ok        " << s.packets_ok << "\n"
+              << "stream_accepted   " << s.stream_accepted << "\n"
+              << "stream_offset     " << s.stream_offset << "\n";
 }
 
 }  // namespace
@@ -342,61 +467,108 @@ void print_status(const Bridge::Status &s) {
 int main(int argc, char **argv) {
     if (argc < 2) {
         std::cerr << "usage: " << argv[0]
-                  << " <port> [file | --status] [--chunk N]\n";
+                  << " <port> [file | --status] [--version]"
+                     " [--clear-counters] [--chunk N] [--start-offset N]\n";
         return 2;
     }
+
     try {
         Bridge bridge(argv[1]);
         bool status_only = false;
+        bool show_version = false;
+        bool clear_counters = false;
         std::string file;
-        size_t chunk = kDefaultChunk;
+        size_t chunk = kWriteMaxData;
+        bool have_start_offset = false;
+        uint32_t start_offset = 0;
+
         for (int i = 2; i < argc; ++i) {
-            const std::string a = argv[i];
-            if (a == "--status") {
+            const std::string arg = argv[i];
+            if (arg == "--status") {
                 status_only = true;
-            } else if (a == "--chunk" && i + 1 < argc) {
+            } else if (arg == "--version") {
+                show_version = true;
+            } else if (arg == "--clear-counters") {
+                clear_counters = true;
+            } else if (arg == "--chunk" && i + 1 < argc) {
                 chunk = std::stoul(argv[++i]);
+            } else if (arg == "--start-offset" && i + 1 < argc) {
+                start_offset = static_cast<uint32_t>(
+                    std::stoul(argv[++i], nullptr, 0));
+                have_start_offset = true;
+            } else if (!arg.empty() && arg[0] == '-') {
+                throw std::runtime_error("unknown option " + arg);
             } else {
-                file = a;
+                file = arg;
             }
         }
 
-        if (status_only || file.empty()) {
-            print_status(bridge.status());
+        if (chunk < kFrameBytes || chunk > kWriteMaxData ||
+            chunk % kFrameBytes != 0) {
+            throw std::runtime_error(
+                "--chunk must be 64..960 and a multiple of 64");
+        }
+
+        if (show_version) {
+            const Bridge::Version v = bridge.version();
+            std::cout << "protocol " << static_cast<int>(v.protocol_major)
+                      << "." << static_cast<int>(v.protocol_minor)
+                      << ", firmware " << static_cast<int>(v.fw_major)
+                      << "." << static_cast<int>(v.fw_minor) << "\n";
             return 0;
         }
 
-        std::ifstream in(file, std::ios::binary | std::ios::ate);
-        if (!in) {
-            throw std::runtime_error("cannot open " + file);
+        if (clear_counters) {
+            bridge.clear_counters();
+            std::cout << "counters cleared\n";
         }
-        const std::streamoff size = in.tellg();
-        if (size < 0 ||
-            size % static_cast<std::streamoff>(kRecord) != 0) {
-            throw std::runtime_error(
-                "file size must be a multiple of 64 bytes (pad the last record)");
+
+        Bridge::Status status = bridge.status();
+        if (status_only || file.empty()) {
+            print_status(status);
+            return 0;
         }
-        in.seekg(0);
+
+        bridge.set_offset(have_start_offset ? start_offset
+                                            : status.stream_accepted);
+        std::cerr << "device stream offset 0x" << std::hex
+                  << bridge.offset() << std::dec << ", ring " << status.free
+                  << " free\n";
+
+        std::ifstream file_in;
+        std::istream *in = &std::cin;
+        if (file != "-") {
+            file_in.open(file, std::ios::binary);
+            if (!file_in) {
+                throw std::runtime_error("cannot open " + file);
+            }
+            in = &file_in;
+        }
 
         std::array<uint8_t, 64 * 1024> buf{};
-        uint64_t total = 0;
-        for (;;) {
-            in.read(reinterpret_cast<char *>(buf.data()),
-                    static_cast<std::streamsize>(buf.size()));
-            const std::streamsize n = in.gcount();
+        while (true) {
+            in->read(reinterpret_cast<char *>(buf.data()),
+                     static_cast<std::streamsize>(buf.size()));
+            const std::streamsize n = in->gcount();
             if (n > 0) {
-                bridge.write_stream(buf.data(), static_cast<size_t>(n), chunk);
-                total += static_cast<uint64_t>(n);
-                std::cerr << "\r" << total << " bytes queued" << std::flush;
+                size_t len = static_cast<size_t>(n);
+                if (len % kFrameBytes != 0) {
+                    const size_t pad = kFrameBytes - len % kFrameBytes;
+                    std::fill_n(buf.begin() + static_cast<long>(len), pad, 0);
+                    len += pad;
+                    std::cerr << "warning: padded " << pad
+                              << " zero bytes\n";
+                }
+                bridge.write_data(buf.data(), len, chunk);
             }
-            if (in.eof()) {
+            if (in->eof()) {
                 break;
             }
-            if (!in) {
+            if (!*in) {
                 throw std::runtime_error("read error");
             }
         }
-        std::cerr << "\n";
+
         print_status(bridge.status());
     } catch (const std::exception &e) {
         std::cerr << "error: " << e.what() << "\n";

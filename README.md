@@ -3,18 +3,19 @@
 RP2350 (Raspberry Pi Pico 2) firmware that turns the board into a **USB-to-SPI-slave
 data bridge**, built on FreeRTOS SMP with static-only memory allocation.
 
-- An external SPI master reads **64 bytes every 1 ms** (exactly **64,000 B/s**), SPI Mode 0, MSB first.
-- A host PC preloads data over USB CDC with a framed, CRC-protected, ACK-flow-controlled protocol.
+- An external SPI master reads **64 bytes every 1 ms** (exactly **64,000 B/s**), SPI Mode 1, MSB first.
+- A host PC preloads data over USB CDC with a compact packet protocol (framing, checksum, status/error codes), extended for 64-byte-aligned streaming.
 - A **384 KiB** main ring buffer caches preloaded data; an **8 KiB** staging ring feeds the SPI peripheral via DMA.
 - DMA runs in RP2350 **ENDLESS** transfer-count mode with address ring wrapping, so feeding the SPI TX FIFO costs no CPU time.
 - When no preloaded data is available, the bridge transmits zeros.
+- Core 0 runs the whole bridge (USB + SPI pump); core 1 only toggles the status LED every 500 ms.
 
 ## Data Path
 
 ```
 Host PC ──USB CDC──> UsbRx task ──WRITE──> 384 KiB SPSC ring
 (core 0, prio 4)                              │
-                                              │ 1 ms pump (core 1, prio 6)
+                                              │ 1 ms pump (core 0, prio 6)
                                               ▼
                                        8 KiB staging ring
                                               │
@@ -34,12 +35,17 @@ Host PC ──USB CDC──> UsbRx task ──WRITE──> 384 KiB SPSC ring
 | SCK        | GP18        | 24         | master → slave |
 | MOSI       | GP16        | 21         | master → slave (unused by the bridge) |
 
-- SPI0 in slave mode, Mode 0 (CPOL=0, CPHA=0), 8-bit frames, MSB first.
+- SPI0 in slave mode, **Mode 1 (CPOL=0, CPHA=1)**, 8-bit frames, MSB first.
+  Mode 0 is not usable when the master holds CS low for a whole 64-byte read:
+  the PL022 slave freezes its shift register while CS is asserted when SPH=0,
+  so it cannot load the next byte from the TX FIFO. Mode 1 allows CS to stay
+  low for the whole transaction. If the master is fixed at Mode 0, it must
+  raise CS between bytes.
 - **3.3 V logic only.** Connect grounds together.
 - On RP2350 the SPI peripheral's TX pin is always the data output and RX always the data
   input, regardless of the bus role. As a slave, **GP19 (SPI0 TX) drives the master's
   MISO**, and **GP16 (SPI0 RX) receives the master's MOSI**.
-- CS has an internal pull-up and SCK a pull-down in Mode 0. The RX input is not used by
+- CS has an internal pull-up and SCK a pull-down (CPOL=0). The RX input is not used by
   the bridge, but its FIFO is drained. The peripheral tristates its output when
   deselected, so it is safe on a shared bus.
 
@@ -59,35 +65,66 @@ board. The build intentionally fails on RP2040 (`#error`) because DMA endless mo
 
 ## USB Protocol
 
-All multi-byte fields are little endian.
+The wire format uses compact `0xAA ... 0x55` framing with a command/status/error
+payload, and a 16-bit length so one packet can carry several 64-byte SPI frames.
+The implementation is in `src/bridge_protocol.c` / `.h`; it has no Pico SDK
+dependencies, and `main.c` supplies the ring and USB callbacks.
+
+This bridge deliberately has **no flash or firmware-upgrade commands**. Firmware
+flashing stays with the RP2350 ROM BOOTSEL/UF2 path.
 
 ```
-AA 55 | type(1) | seq(2) | len(2) | payload(len) | crc16(2)
+0xAA | chksum | len_lo | len_hi | payload[len] | 0x55
 ```
 
-- `crc16` is CRC-16/CCITT-FALSE: polynomial `0x1021`, init `0xFFFF`, no reflection.
-- CRC covers `type` through the end of `payload` (the 5 header bytes plus payload).
-- `seq` is echoed in the reply so late/stale replies can be discarded.
+- `chksum` makes the 8-bit sum of the complete packet, including the checksum
+  byte and the rear `0x55`, zero (two's complement of the sum).
+- `len` is little-endian, 2..1019; the total packet is `len + 5` bytes.
+- `payload[0]` is the command; `payload[1]` is reserved (0) in requests and
+  carries the status in responses.
+- Multi-byte fields are little-endian, except error codes, which are sent as a
+  type byte followed by a code byte (high byte first).
+
+A packet with a bad length, checksum, or rear byte is dropped. Checksum errors
+are counted in `checksum_errors`; the host retries a WRITE after its response
+timeout and the stream offset prevents duplication.
 
 ### Commands
 
-| Type | Name | Payload | Reply |
-|------|------|---------|-------|
-| `0x01` | WRITE | 0–4096 data bytes, appended to the ring | `0x81` ACK |
-| `0x02` | STATUS | none | `0x82` STATUS |
+| Cmd | Name | Request payload | Response payload |
+|-----|------|-----------------|------------------|
+| `0x01` | WRITE_DATA | `seq[2], offset[4], data[N]` | `seq[2], offset[4], accepted[2], stream_accepted[4], free[4], err[2]` |
+| `0x02` | GET_STATUS | none | 13 × u32, see below |
+| `0x03` | CLEAR_COUNTERS | none | none |
+| `0x04` | GET_VERSION | none | `major, minor, fw_major, fw_minor` |
 
-### ACK (`0x81`, 12-byte payload)
+Status byte: `0x01` success, `0x02` busy (reserved), `0x03` error.
 
-| Offset | Type | Field |
-|--------|------|-------|
-| 0 | u32 | `accepted` — bytes actually queued (may be less than sent) |
-| 4 | u32 | `used` — bytes currently in the ring |
-| 8 | u32 | `free` — free space in the ring |
+WRITE_DATA rules:
 
-A short accept means the ring is full: resend the remaining bytes later. The reference
-loader implements this flow control.
+- `N` must be a multiple of **64** and at most **960** (15 frames). The device
+  rejects other lengths with `ERR_NOT_ALIGNED` or `ERR_INVALID_LENGTH`. This
+  keeps every ring append frame-aligned, so the SPI master always sees whole
+  64-byte transactions.
+- `offset` is the absolute byte position in the host stream. The device only
+  accepts a packet when `offset == stream_accepted`. A retry after a lost ACK
+  therefore returns `ERR_OFFSET` plus the current `stream_accepted` instead of
+  queuing the same bytes twice.
+- When the ring is full, `accepted < N` and `err = ERR_RING_FULL`. The host
+  waits and resends `data + accepted` at the new offset. `accepted` is always a
+  multiple of 64 because the ring capacity and every append are frame-aligned.
+- The stream is append-only. On connect the loader reads GET_STATUS and
+  continues at the device's `stream_accepted`, unless `--start-offset` is
+  given. Restarting from zero requires an MCU reset; there is no flush command
+  and consumed bytes cannot be replayed.
+- Send one WRITE packet at a time and read its response before sending the
+  next. The device has a 4 KiB CDC TX buffer; a host that never drains
+  responses can stall the USB task. The reference loaders do this.
+- CLEAR_COUNTERS clears `checksum_errors`, `bad_packets`, `ring_full_events`,
+  `packets_ok`, `zero_fill` and `underrun_events`. It does not touch buffered
+  data, `stream_accepted` or `spi_consumed`.
 
-### STATUS (`0x82`, 40-byte payload)
+### Status fields (GET_STATUS, 13 × u32)
 
 | Field | Description |
 |-------|-------------|
@@ -96,10 +133,26 @@ loader implements this flow control.
 | `stage_ahead` | Bytes staged ahead of the DMA read position |
 | `spi_consumed` | Bytes fed into the SPI TX FIFO (includes FIFO lookahead) |
 | `zero_fill` | Bytes synthesized as zeros because the main ring was empty |
-| `crc_errors` | Frames dropped due to CRC mismatch |
-| `bad_frames` | Valid-CRC frames with an unknown type or oversized payload |
-| `underrun_events` | Pump fell behind the DMA |
-| `ring_full_events` | WRITE payloads that were only partially accepted |
+| `checksum_errors` | Packets dropped due to checksum/rear mismatch |
+| `bad_packets` | Oversized/unknown command or invalid-length packets |
+| `ring_full_events` | WRITE packets that were only partially accepted |
+| `underrun_events` | Pump fell behind the DMA (safety resync) |
+| `packets_ok` | Valid packets dispatched |
+| `stream_accepted` | Total bytes accepted since boot (32-bit wrapping) |
+| `stream_offset` | `stream_accepted % 64`; should always be 0 |
+
+### Error codes
+
+| Code | Name | Meaning |
+|------|------|---------|
+| `0x0000` | `ERR_SUCCESS` | success |
+| `0x0101` | `ERR_INVALID_LENGTH` | zero/oversized payload |
+| `0x0104` | `ERR_UNSUPPORT` | unknown command |
+| `0x0106` | `ERR_CHECKSUM` | checksum error (counter only) |
+| `0x0201` | `ERR_RING_FULL` | packet partially accepted |
+| `0x0202` | `ERR_NOT_ALIGNED` | data length not a multiple of 64 |
+| `0x0203` | `ERR_OFFSET` | stream offset mismatch |
+| `0xFFFF` | `ERR_UNEXPECT` | unexpected error |
 
 ## Host Loader
 
@@ -108,14 +161,15 @@ The repository includes `tools/usb_loader.py` (requires Python 3 and `pyserial`)
 ```bash
 pip install pyserial
 
-# Bridge counters only
+# Counters, protocol version, clear counters
 python3 tools/usb_loader.py --status
+python3 tools/usb_loader.py --version
+python3 tools/usb_loader.py --clear-counters
 
 # Preload a file (auto-detects USB VID:PID 2e8a:0009)
+# By default the loader continues at the device's stream_accepted (append).
 python3 tools/usb_loader.py data.bin
-
-# Explicit port; status is printed after loading anyway
-python3 tools/usb_loader.py -p /dev/ttyACM0 -s data.bin
+python3 tools/usb_loader.py -p /dev/ttyACM0 --start-offset 0 data.bin
 
 # Stream from stdin
 cat data.bin | python3 tools/usb_loader.py -
@@ -124,14 +178,23 @@ cat data.bin | python3 tools/usb_loader.py -
 A dependency-free C++17 loader (Linux/POSIX, `termios` + `poll`) is also provided:
 
 ```bash
-g++ -std=c++17 -O2 -o usb_loader tools/usb_loader.cpp
+g++ -std=c++17 -O2 -Wall -Wextra -Werror -o usb_loader tools/usb_loader.cpp
 ./usb_loader /dev/ttyACM0 --status
+./usb_loader /dev/ttyACM0 --version
 ./usb_loader /dev/ttyACM0 data.bin
+cat data.bin | ./usb_loader /dev/ttyACM0 -
 ```
 
-Data is **consumed**: each byte is sent to the master at most once. Loading the same file
-twice queues it twice. If the SPI master is not running, the ring fills up and the loader
-stops with a timeout after `--stall-timeout` seconds (default 10).
+Files are sent in **64-byte frames**; a trailing partial frame is padded with
+zero bytes and reported with a warning. WRITE payloads are at most 960 bytes
+(15 frames), and a full/partial ring is handled automatically via
+`ERR_RING_FULL` and the stream offset. If the SPI master is not running, the
+ring fills up and the loader stops after `--stall-timeout` seconds (default 10).
+
+The stream is **consumed and append-only**: each byte is sent to the master at
+most once, and a retried packet is not queued twice. Loading the same file
+twice appends it twice. To start a new stream from offset 0, reset the MCU
+(or pass `--start-offset` only when you know the device is at that offset).
 
 On Linux the port usually belongs to the `dialout` group:
 
@@ -142,20 +205,25 @@ sudo usermod -aG dialout "$USER"   # log out and back in
 ## Buffer and Real-Time Behavior
 
 - **384 KiB** holds exactly **6 seconds** of data at the 64,000 B/s drain rate.
-- The pump task runs every 1 ms on core 1 at priority 6 and keeps up to 512 bytes
-  (8 ms worth) staged ahead of the DMA. The USB task runs on core 0, so USB traffic
-  cannot delay the pump.
+- The pump task runs every 1 ms on core 0 at priority 6 and keeps up to 512 bytes
+  (8 ms worth) staged ahead of the DMA. The USB task also runs on core 0 at priority 4,
+  so the pump preempts it; the 512-byte prefetch and 8 KiB staging ring absorb normal
+  USB IRQ/scheduling jitter. Core 1 only runs the status LED task (500 ms toggle).
+- The DMA read cursor advances byte-by-byte, but the pump refills the staging ring in
+  whole 64-byte units. That keeps the main-ring tail and free space frame-aligned, so a
+  partial WRITE accept never splits a 64-byte transaction.
 - The DMA never stops: on an empty main ring the pump stages zeros, so the master always
   clocks valid data. Because up to 512 bytes are staged ahead of the DMA, data loaded while
   the master is idle can be preceded by up to 512 already-staged bytes (≈8 ms at the nominal rate).
 - Sustained preload throughput is limited by the master's drain rate once the ring is full.
   A master that reads slower than 64,000 B/s will drain the ring proportionally slower.
-- The bridge is robust to USB disconnects: the partial frame parser resets on reconnect,
-  and buffered data survives.
+- The bridge is robust to USB disconnects: the partial packet parser resets on reconnect,
+  the device keeps its stream offset, and buffered data survives. Query GET_STATUS to
+  resume appending at `stream_accepted`.
 
 ## Customization
 
-At the top of `src/hello_freertos.c`:
+At the top of `src/main.c`:
 
 - `BRIDGE_SPI`, `BRIDGE_PIN_TX`/`RX`/`CS`/`SCK`, `BRIDGE_SPI_CPOL`/`BRIDGE_SPI_CPHA` —
   peripheral, pins, mode. `TX` is the slave output (master MISO) and `RX` the slave input.
@@ -164,12 +232,22 @@ At the top of `src/hello_freertos.c`:
   power-of-two and is aligned to its size; the DMA ring limit is 32 KiB.
 - `STAGE_PREFETCH`, `PUMP_PERIOD_MS` — real-time tradeoff.
 
+Protocol configuration lives in `src/bridge_protocol.h`:
+
+- `BRIDGE_FRAME_BYTES` / `BRIDGE_WRITE_MAX_DATA` — SPI frame size and the largest
+  WRITE payload (15 frames = 960 bytes). Keep both multiples of the frame size.
+- `BRIDGE_PACKET_MAX_SIZE` — USB packet buffer limit (1024 bytes);
+  `BRIDGE_PACKET_MAX_PAYLOAD` follows from it.
+- `BRIDGE_CMD_*`, `BRIDGE_ERR_*`, protocol/firmware version numbers.
+
 FreeRTOS tunables live in `FreeRTOSConfig_examples_common.h`; the app uses static
 allocation only, so new tasks must use `xTaskCreateStatic()`.
 
 USB CDC options are set in `CMakeLists.txt`:
 
 - `CFG_TUD_CDC_RX_BUFSIZE=8192` — larger endpoint buffering for high-rate preloads.
+- `CFG_TUD_CDC_TX_BUFSIZE=4096` — room for several WRITE responses so the USB task
+  does not block on TX.
 - `PICO_STDIO_USB_CONNECTION_WITHOUT_DTR=1` — accept hosts that do not assert DTR.
 
 ## File Structure
@@ -177,8 +255,11 @@ USB CDC options are set in `CMakeLists.txt`:
 ```
 pico2-freertos-template/
 ├── CMakeLists.txt                        # Build target, static allocation, stdio USB options
-├── src/hello_freertos.c                  # Bridge firmware (SPI slave, DMA, USB protocol, tasks)
-├── tools/usb_loader.py                   # Reference host loader / STATUS tool
+├── src/main.c                            # Bridge app (SPI slave, DMA, ring, tasks, entry point)
+├── src/bridge_protocol.c                 # USB packet parser/commands (no SDK dependencies)
+├── src/bridge_protocol.h                 # Protocol constants, ops callbacks, state
+├── tools/usb_loader.py                   # Reference host loader / STATUS tool (pyserial)
+├── tools/usb_loader.cpp                  # C++17 host loader (Linux/POSIX)
 ├── cmake/                                # SDK / FreeRTOS import helpers
 ├── FreeRTOSConfig.h                      # FreeRTOS configuration entry point
 ├── FreeRTOSConfig_examples_common.h      # Tunables
@@ -201,9 +282,16 @@ pico2-freertos-template/
 A: Pass `--port` explicitly and check `lsusb` for `2e8a:0009`. On Linux, make sure your
 user is in the `dialout` group (`/dev/ttyACM0` permissions).
 
-**Q: The loader times out with "ring stayed full"**
+**Q: The loader reports `ERR_RING_FULL` / `ring stalled`**
 A: The SPI master is not clocking data out, so the 384 KiB ring cannot drain. Verify SCK,
-CS, common ground, and Mode 0 on the master.
+CS, common ground, and **Mode 1** on the master. `ERR_RING_FULL` itself is normal
+backpressure when the host runs ahead of the 64,000 B/s drain.
+
+**Q: The loader reports `ERR_OFFSET` / "device offset does not match"**
+A: The device's `stream_accepted` does not match the host's offset. This is expected after
+a retried WRITE (the loader handles it automatically) or after a host restart. Query
+`--status` and start at the reported `stream_accepted`, or reset the MCU to restart the
+stream from zero.
 
 **Q: `underrun_events` or `zero_fill` keeps increasing**
 A: The host is not supplying data fast enough. Check the loader's progress output and USB

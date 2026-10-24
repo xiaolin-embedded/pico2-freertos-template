@@ -39,7 +39,8 @@ include(cmake/FreeRTOS_Kernel_import.cmake)
 # pico2-freertos-template — FreeRTOS SMP with static memory allocation
 # ============================================================================
 add_executable(pico2-freertos-template
-    src/hello_freertos.c
+    src/main.c
+    src/bridge_protocol.c
 )
 target_include_directories(pico2-freertos-template PRIVATE
     ${CMAKE_CURRENT_LIST_DIR}
@@ -55,6 +56,8 @@ target_compile_definitions(pico2-freertos-template PRIVATE
     configSUPPORT_DYNAMIC_ALLOCATION=0
     # Larger CDC RX FIFO: the host preloads data faster than the SPI drain rate.
     CFG_TUD_CDC_RX_BUFSIZE=8192
+    # Room for several WRITE responses so the USB task does not block on TX.
+    CFG_TUD_CDC_TX_BUFSIZE=4096
     # Accept data from custom hosts that do not assert DTR.
     PICO_STDIO_USB_CONNECTION_WITHOUT_DTR=1
 )
