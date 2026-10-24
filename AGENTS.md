@@ -26,7 +26,7 @@ picotool load -fx build/pico2-freertos-template.uf2
 
 ## Architecture
 
-- App code lives in **`src/main.c`**; the USB packet protocol is a separate, SDK-independent module in **`src/bridge_protocol.c` / `src/bridge_protocol.h`**. There is **no `include/` dir**; headers sit next to their sources, and the repo root remains the include path (that's how `FreeRTOSConfig.h` is found).
+- App code lives in **`src/main.c`**; the USB packet protocol is a separate, SDK-independent module in **`src/bridge_protocol.c` / `src/bridge_protocol.h`**. There is **no `include/` dir**; headers sit next to their sources, and the repo root remains the include path (that's how `FreeRTOSConfig.h` is found). The full protocol design and adaptation rationale are in `docs/bridge-protocol-design.md`.
 - **App is a USB CDC → SPI0 slave bridge.** External master reads 64 B every 1 ms (**Mode 1**, MSB first). Slave output (master MISO) = GP19/SPI0 TX, slave input (master MOSI) = GP16/SPI0 RX, CS = GP17, SCK = GP18. The peripheral's TX/RX directions do not flip with the bus role. Mode 1 is required: with SPH=0 the PL022 freezes its shift register while CS is low and cannot load the next byte from the TX FIFO.
 - Startup chain: `main()` → `stdio_init_all()` → `bridge_hardware_init()` (SPI slave + DMA channel config, DMA **not** started) → banner `printf` → `vLaunch()` → tasks → `vTaskStartScheduler()`.
 - Tasks, all static: core 0 runs the bridge — `UsbRx` (prio 4; parses the USB packet protocol, writes 384 KiB SPSC ring) and `SpiPump` (prio 6; 1 ms period, tracks DMA position, keeps an 8 KiB staging ring ≥512 B ahead, zero-fills on empty). Core 1 runs only `Blink` (prio 1; on-board LED, 500 ms toggle).

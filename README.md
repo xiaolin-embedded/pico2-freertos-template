@@ -73,6 +73,9 @@ dependencies, and `main.c` supplies the ring and USB callbacks.
 This bridge deliberately has **no flash or firmware-upgrade commands**. Firmware
 flashing stays with the RP2350 ROM BOOTSEL/UF2 path.
 
+See [docs/bridge-protocol-design.md](docs/bridge-protocol-design.md) for the full
+design, the adaptation rationale, and host integration notes.
+
 ```
 0xAA | chksum | len_lo | len_hi | payload[len] | 0x55
 ```
@@ -258,6 +261,7 @@ pico2-freertos-template/
 ├── src/main.c                            # Bridge app (SPI slave, DMA, ring, tasks, entry point)
 ├── src/bridge_protocol.c                 # USB packet parser/commands (no SDK dependencies)
 ├── src/bridge_protocol.h                 # Protocol constants, ops callbacks, state
+├── docs/bridge-protocol-design.md        # Protocol design and adaptation notes
 ├── tools/usb_loader.py                   # Reference host loader / STATUS tool (pyserial)
 ├── tools/usb_loader.cpp                  # C++17 host loader (Linux/POSIX)
 ├── cmake/                                # SDK / FreeRTOS import helpers
