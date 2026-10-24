@@ -159,33 +159,33 @@ WRITE_DATA rules:
 
 ## Host Loader
 
-The repository includes `tools/usb_loader.py` (requires Python 3 and `pyserial`):
+The repository includes `tools/usb_stream.py` (requires Python 3 and `pyserial`):
 
 ```bash
 pip install pyserial
 
 # Counters, protocol version, clear counters
-python3 tools/usb_loader.py --status
-python3 tools/usb_loader.py --version
-python3 tools/usb_loader.py --clear-counters
+python3 tools/usb_stream.py --status
+python3 tools/usb_stream.py --version
+python3 tools/usb_stream.py --clear-counters
 
 # Preload a file (auto-detects USB VID:PID 2e8a:0009)
 # By default the loader continues at the device's stream_accepted (append).
-python3 tools/usb_loader.py data.bin
-python3 tools/usb_loader.py -p /dev/ttyACM0 --start-offset 0 data.bin
+python3 tools/usb_stream.py data.bin
+python3 tools/usb_stream.py -p /dev/ttyACM0 --start-offset 0 data.bin
 
 # Stream from stdin
-cat data.bin | python3 tools/usb_loader.py -
+cat data.bin | python3 tools/usb_stream.py -
 ```
 
 A dependency-free C++17 loader (Linux/POSIX, `termios` + `poll`) is also provided:
 
 ```bash
-g++ -std=c++17 -O2 -Wall -Wextra -Werror -o usb_loader tools/usb_loader.cpp
-./usb_loader /dev/ttyACM0 --status
-./usb_loader /dev/ttyACM0 --version
-./usb_loader /dev/ttyACM0 data.bin
-cat data.bin | ./usb_loader /dev/ttyACM0 -
+g++ -std=c++17 -O2 -Wall -Wextra -Werror -o usb_stream tools/usb_stream.cpp
+./usb_stream /dev/ttyACM0 --status
+./usb_stream /dev/ttyACM0 --version
+./usb_stream /dev/ttyACM0 data.bin
+cat data.bin | ./usb_stream /dev/ttyACM0 -
 ```
 
 Files are sent in **64-byte frames**; a trailing partial frame is padded with
@@ -262,8 +262,8 @@ pico2-freertos-template/
 ├── src/bridge_protocol.c                 # USB packet parser/commands (no SDK dependencies)
 ├── src/bridge_protocol.h                 # Protocol constants, ops callbacks, state
 ├── docs/bridge-protocol-design.md        # Protocol design and adaptation notes
-├── tools/usb_loader.py                   # Reference host loader / STATUS tool (pyserial)
-├── tools/usb_loader.cpp                  # C++17 host loader (Linux/POSIX)
+├── tools/usb_stream.py                   # Reference host loader / STATUS tool (pyserial)
+├── tools/usb_stream.cpp                  # C++17 host loader (Linux/POSIX)
 ├── cmake/                                # SDK / FreeRTOS import helpers
 ├── FreeRTOSConfig.h                      # FreeRTOS configuration entry point
 ├── FreeRTOSConfig_examples_common.h      # Tunables
@@ -278,11 +278,11 @@ pico2-freertos-template/
 | [pico-sdk](https://github.com/raspberrypi/pico-sdk) | submodule `pico-sdk/` | 2.3.0 |
 | [FreeRTOS-Kernel](https://github.com/raspberrypi/FreeRTOS-Kernel) | submodule `FreeRTOS-Kernel/` | RP2350 port support |
 | [tinyusb](https://github.com/hathach/tinyusb) | pico-sdk submodule | 0.18.0 |
-| [pyserial](https://pyserial.readthedocs.io/) | host, pip | for `tools/usb_loader.py` |
+| [pyserial](https://pyserial.readthedocs.io/) | host, pip | for `tools/usb_stream.py` |
 
 ## FAQ
 
-**Q: `usb_loader.py` cannot find the device**
+**Q: `usb_stream.py` cannot find the device**
 A: Pass `--port` explicitly and check `lsusb` for `2e8a:0009`. On Linux, make sure your
 user is in the `dialout` group (`/dev/ttyACM0` permissions).
 

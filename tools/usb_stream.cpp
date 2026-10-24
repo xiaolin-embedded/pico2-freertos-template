@@ -1,12 +1,12 @@
-// C++17 host loader for the RP2350 USB -> SPI-slave bridge (Linux/POSIX).
+// C++17 host stream tool for the RP2350 USB -> SPI-slave bridge (Linux/POSIX).
 //
 // Packet format:
 //   0xAA | chksum | len_lo | len_hi | payload[len] | 0x55
 // chksum makes the 8-bit sum of the complete packet zero.
 //
-// Build: g++ -std=c++17 -O2 -Wall -Wextra -Werror -o usb_loader usb_loader.cpp
-// Usage: ./usb_loader /dev/ttyACM0 data.bin
-//        ./usb_loader /dev/ttyACM0 --status
+// Build: g++ -std=c++17 -O2 -Wall -Wextra -Werror -o usb_stream usb_stream.cpp
+// Usage: ./usb_stream /dev/ttyACM0 data.bin
+//        ./usb_stream /dev/ttyACM0 --status
 
 #include <algorithm>
 #include <array>

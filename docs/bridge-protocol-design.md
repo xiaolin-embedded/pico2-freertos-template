@@ -2,7 +2,7 @@
 
 - 文档状态：与当前实现同步（协议版本 2.0）
 - 适用固件：`src/main.c` + `src/bridge_protocol.c/.h`
-- 上位机参考实现：`tools/usb_loader.py`、`tools/usb_loader.cpp`
+- 上位机参考实现：`tools/usb_stream.py`、`tools/usb_stream.cpp`
 - 最后更新：2026-10-24
 
 ## 1. 背景与需求
@@ -367,6 +367,6 @@ for each block of data (length multiple of 64, <= 960):
 | 协议常量、状态结构、回调接口 | `src/bridge_protocol.h` |
 | 帧解析、命令处理、状态响应 | `src/bridge_protocol.c` |
 | ring、pump、DMA、任务、SPI 初始化 | `src/main.c` |
-| Python 上位机参考实现 | `tools/usb_loader.py` |
-| C++17 上位机参考实现 | `tools/usb_loader.cpp` |
+| Python 上位机参考实现 | `tools/usb_stream.py` |
+| C++17 上位机参考实现 | `tools/usb_stream.cpp` |
 | 用户手册 | `README.md` |
