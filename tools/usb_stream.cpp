@@ -12,10 +12,13 @@
 #include <array>
 #include <cerrno>
 #include <chrono>
+#include <csignal>
 #include <cstdint>
 #include <cstring>
 #include <fcntl.h>
 #include <fstream>
+#include <functional>
+#include <iomanip>
 #include <iostream>
 #include <poll.h>
 #include <stdexcept>
@@ -29,6 +32,9 @@
 namespace {
 
 using Clock = std::chrono::steady_clock;
+
+volatile std::sig_atomic_t g_stop = 0;
+void on_sigint(int) { g_stop = 1; }
 
 constexpr uint8_t kHead = 0xAA;
 constexpr uint8_t kRear = 0x55;
@@ -167,6 +173,15 @@ public:
 
     void set_offset(uint32_t offset) { offset_ = offset; }
     uint32_t offset() const { return offset_; }
+    uint32_t last_free() const { return last_free_; }
+
+    void send_chunk(const uint8_t *data, size_t len) {
+        if (len == 0 || len % kFrameBytes != 0 || len > kWriteMaxData) {
+            throw std::invalid_argument(
+                "chunk must be 64..960 bytes, multiple of 64");
+        }
+        write_data(data, len, len);
+    }
 
     Status status() {
         std::vector<uint8_t> p = transact({kCmdStatus, 0}, kCmdStatus);
@@ -276,6 +291,7 @@ private:
     struct WriteRsp {
         uint16_t accepted = 0;
         uint32_t stream_accepted = 0;
+        uint32_t free = 0;
         uint16_t err = 0xFFFF;
     };
 
@@ -320,7 +336,9 @@ private:
         WriteRsp rsp;
         rsp.accepted = le16(&p[8]);
         rsp.stream_accepted = le32(&p[10]);
+        rsp.free = le32(&p[14]);
         rsp.err = static_cast<uint16_t>((p[18] << 8) | p[19]);
+        last_free_ = rsp.free;
         const uint16_t rsp_seq = le16(&p[2]);
         const uint32_t rsp_offset = le32(&p[4]);
         if (rsp_seq != seq || rsp_offset != offset) {
@@ -443,6 +461,7 @@ private:
     int retries_;
     uint16_t seq_ = 0;
     uint32_t offset_ = 0;
+    uint32_t last_free_ = 0;
     std::vector<uint8_t> rx_;
 };
 
@@ -492,6 +511,85 @@ void write_pattern(Bridge &bridge, size_t chunk, uint64_t frames) {
     std::cerr << "\n";
 }
 
+using ChunkSource = std::function<bool(std::vector<uint8_t> &)>;
+
+void print_stream_report(double elapsed, const Bridge::Status &s) {
+    std::cerr << "[" << std::fixed << std::setprecision(1) << elapsed << "s]"
+              << " used=" << s.used << " free=" << s.free
+              << " stage=" << s.stage_ahead << " spi=" << s.spi_consumed
+              << " zero=" << s.zero_fill << " full=" << s.ring_full_events
+              << " under=" << s.underrun_events << " crc=" << s.checksum_errors
+              << " bad=" << s.bad_packets << " stream=" << s.stream_accepted
+              << " off=" << s.stream_offset << "\n";
+}
+
+// Feed an endless source, keeping the device ring near a target level.
+void stream_continuous(Bridge &bridge, const ChunkSource &next_chunk,
+                       size_t chunk, uint32_t capacity, uint32_t initial_used,
+                       int watermark_ms, double report_s, double duration_s) {
+    uint32_t target =
+        watermark_ms > 0
+            ? std::max<uint32_t>(static_cast<uint32_t>(watermark_ms) * 64u,
+                                 static_cast<uint32_t>(chunk))
+            : 0;
+    if (target > capacity) {
+        target = capacity;
+    }
+    uint32_t used = initial_used;
+    std::vector<uint8_t> block;
+
+    if (target > 0) {
+        while (used < target && g_stop == 0) {
+            if (!next_chunk(block)) {
+                return;
+            }
+            bridge.send_chunk(block.data(), block.size());
+            used = bridge.last_free() <= capacity
+                       ? capacity - bridge.last_free()
+                       : 0;
+        }
+        std::cerr << "preloaded " << used << " bytes (target " << target
+                  << "); streaming continuously\n";
+    }
+
+    const auto start = Clock::now();
+    auto last_report = start;
+    while (g_stop == 0) {
+        const auto now = Clock::now();
+        const double elapsed =
+            std::chrono::duration<double>(now - start).count();
+        if (duration_s > 0 && elapsed >= duration_s) {
+            break;
+        }
+        if (report_s > 0 &&
+            std::chrono::duration<double>(now - last_report).count() >=
+                report_s) {
+            const Bridge::Status st = bridge.status();
+            print_stream_report(elapsed, st);
+            used = st.used;
+            last_report = now;
+        }
+        if (target > 0 && used > target) {
+            uint32_t wait_ms =
+                std::min<uint32_t>((used - target) / 64u, 100u);
+            if (wait_ms == 0) {
+                wait_ms = 1;
+            }
+            std::this_thread::sleep_for(
+                std::chrono::milliseconds(wait_ms));
+            used = used > wait_ms * 64u ? used - wait_ms * 64u : 0;
+            continue;
+        }
+        if (!next_chunk(block)) {
+            break;
+        }
+        bridge.send_chunk(block.data(), block.size());
+        used = bridge.last_free() <= capacity
+                   ? capacity - bridge.last_free()
+                   : 0;
+    }
+}
+
 }  // namespace
 
 int main(int argc, char **argv) {
@@ -499,7 +597,8 @@ int main(int argc, char **argv) {
         std::cerr << "usage: " << argv[0]
                   << " <port> [file | --pattern] [--status] [--version]"
                      " [--clear-counters] [--chunk N] [--start-offset N]"
-                     " [--frames N]\n";
+                     " [--frames N] [--loop] [--watermark-ms N]"
+                     " [--report S] [--duration S]\n";
         return 2;
     }
 
@@ -510,7 +609,11 @@ int main(int argc, char **argv) {
         bool clear_counters = false;
         bool pattern = false;
         bool frames_set = false;
+        bool loop = false;
         uint64_t frames = 0;
+        int watermark_ms = 200;
+        double report_s = 5.0;
+        double duration_s = 0.0;
         std::string file;
         size_t chunk = kWriteMaxData;
         bool have_start_offset = false;
@@ -533,6 +636,14 @@ int main(int argc, char **argv) {
                 }
                 frames = static_cast<uint64_t>(value);
                 frames_set = true;
+            } else if (arg == "--loop") {
+                loop = true;
+            } else if (arg == "--watermark-ms" && i + 1 < argc) {
+                watermark_ms = std::stoi(argv[++i]);
+            } else if (arg == "--report" && i + 1 < argc) {
+                report_s = std::stod(argv[++i]);
+            } else if (arg == "--duration" && i + 1 < argc) {
+                duration_s = std::stod(argv[++i]);
             } else if (arg == "--chunk" && i + 1 < argc) {
                 chunk = std::stoul(argv[++i]);
             } else if (arg == "--start-offset" && i + 1 < argc) {
@@ -556,6 +667,25 @@ int main(int argc, char **argv) {
         }
         if (pattern && !file.empty()) {
             throw std::runtime_error("--pattern does not take a file");
+        }
+        if (loop && pattern) {
+            throw std::runtime_error(
+                "--loop cannot be combined with --pattern");
+        }
+        if (loop && file.empty()) {
+            throw std::runtime_error("--loop requires a file");
+        }
+        if (loop && file == "-") {
+            throw std::runtime_error("--loop requires a seekable file");
+        }
+        if (watermark_ms < 0) {
+            throw std::runtime_error("--watermark-ms must be >= 0");
+        }
+        if (report_s < 0) {
+            throw std::runtime_error("--report must be >= 0");
+        }
+        if (duration_s < 0) {
+            throw std::runtime_error("--duration must be >= 0");
         }
 
         if (show_version) {
@@ -583,6 +713,72 @@ int main(int argc, char **argv) {
         std::cerr << "device stream offset 0x" << std::hex
                   << bridge.offset() << std::dec << ", ring " << status.free
                   << " free\n";
+
+        const bool continuous_pattern = pattern && (!frames_set || frames == 0);
+        const bool continuous_file = !file.empty() && loop;
+        if (continuous_pattern || continuous_file) {
+            std::signal(SIGINT, on_sigint);
+            ChunkSource source;
+            std::ifstream loop_in;
+            uint64_t pattern_frame = 0;
+            if (continuous_pattern) {
+                source = [&](std::vector<uint8_t> &block) -> bool {
+                    const size_t per_chunk = chunk / kFrameBytes;
+                    block.resize(per_chunk * kFrameBytes);
+                    for (size_t i = 0; i < per_chunk; ++i) {
+                        const uint8_t value = static_cast<uint8_t>(
+                            (pattern_frame + i) & 0xFF);
+                        std::fill_n(
+                            block.begin() +
+                                static_cast<long>(i * kFrameBytes),
+                            kFrameBytes, value);
+                    }
+                    pattern_frame += per_chunk;
+                    return true;
+                };
+            } else {
+                loop_in.open(file, std::ios::binary);
+                if (!loop_in) {
+                    throw std::runtime_error("cannot open " + file);
+                }
+                source = [&](std::vector<uint8_t> &block) -> bool {
+                    block.resize(chunk);
+                    loop_in.read(
+                        reinterpret_cast<char *>(block.data()),
+                        static_cast<std::streamsize>(chunk));
+                    std::streamsize n = loop_in.gcount();
+                    if (n == 0) {
+                        loop_in.clear();
+                        loop_in.seekg(0);
+                        loop_in.read(
+                            reinterpret_cast<char *>(block.data()),
+                            static_cast<std::streamsize>(chunk));
+                        n = loop_in.gcount();
+                        if (loop_in.bad()) {
+                            throw std::runtime_error("file read error");
+                        }
+                        if (n == 0) {
+                            throw std::runtime_error(
+                                "cannot loop an empty file");
+                        }
+                    }
+                    size_t len = static_cast<size_t>(n);
+                    if (len % kFrameBytes != 0) {
+                        const size_t pad = kFrameBytes - len % kFrameBytes;
+                        block.resize(len + pad, 0);
+                        len += pad;
+                    } else {
+                        block.resize(len);
+                    }
+                    return true;
+                };
+            }
+            stream_continuous(bridge, source, chunk, status.capacity,
+                              status.used, watermark_ms, report_s,
+                              duration_s);
+            print_status(bridge.status());
+            return 0;
+        }
 
         if (pattern) {
             write_pattern(bridge, chunk, frames);

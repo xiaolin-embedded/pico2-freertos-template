@@ -159,7 +159,8 @@ WRITE_DATA rules:
 
 ## Host Stream Tool
 
-The repository includes `tools/usb_stream.py` (requires Python 3 and `pyserial`):
+The repository includes `tools/usb_stream.py` (requires Python 3 and `pyserial`).
+See [tools/README.md](tools/README.md) for the complete build and command guide.
 
 ```bash
 pip install pyserial
@@ -198,7 +199,7 @@ as its first argument.
 Both tools can generate a test stream instead of reading a file. Frame index N
 (starts at 0) is 64 bytes, all filled with byte `N & 0xFF`: the first frame is
 `0x00`, frame index 255 is `0xFF`, and index 256 wraps to `0x00` again. Without
-`--frames` the pattern runs until Ctrl-C; `--frames N` stops after N frames.
+`--frames` the pattern is continuous; `--frames N` stops after N frames.
 
 ```bash
 # Endless pattern on /dev/ttyACM1
@@ -216,11 +217,42 @@ per WRITE. Use a freshly reset MCU (or `--start-offset 0`) for a deterministic
 first frame; otherwise the pattern is appended after existing data. `--pattern`
 cannot be combined with a file.
 
+### Continuous streaming
+
+For long logic-analyzer runs, both tools can feed the bridge indefinitely and
+keep a target amount of data buffered instead of filling the whole ring:
+
+- `--pattern` without `--frames`: endless pattern.
+- `--loop`: replay the input file endlessly.
+- `--watermark-ms N`: target device-ring level (default **200 ms**;
+  `0` disables throttling and fills the ring until WRITE backpressure).
+- `--report S`: print a compact STATUS line every S seconds (default 5;
+  `0` disables reports).
+- `--duration S`: stop after S seconds (omit/0 = until Ctrl-C).
+
+```bash
+# Continuous pattern with a 200 ms device buffer; Ctrl-C to stop
+python3 tools/usb_stream.py -p /dev/ttyACM1 --pattern
+./usb_stream /dev/ttyACM1 --pattern
+
+# Replay a file for 60 s; status every 5 s
+python3 tools/usb_stream.py -p /dev/ttyACM1 --loop --duration 60 data.bin
+
+# Keep 500 ms buffered and report every second
+./usb_stream /dev/ttyACM1 --pattern --watermark-ms 500 --report 1
+```
+
+The continuous loop keeps one WRITE in flight, uses the ACK's `free`/`accepted`
+for flow control, and waits when the ring is above the watermark. One-shot
+files and `--frames N` patterns still send as fast as the ring accepts.
+
 Files are sent in **64-byte frames**; a trailing partial frame is padded with
 zero bytes and reported with a warning. WRITE payloads are at most 960 bytes
 (15 frames), and a full/partial ring is handled automatically via
-`ERR_RING_FULL` and the stream offset. If the SPI master is not running, the
-ring fills up and the loader stops after `--stall-timeout` seconds (default 10).
+`ERR_RING_FULL` and the stream offset. In one-shot mode, a stalled master fills
+the ring and WRITE retries stop after `--stall-timeout` seconds (default 10).
+In continuous mode with a nonzero watermark, the tool preloads to the watermark
+and waits/reports while the master is idle; use `--duration` or Ctrl-C to stop.
 
 The stream is **consumed and append-only**: each byte is sent to the master at
 most once, and a retried packet is not queued twice. Loading the same file
@@ -290,6 +322,7 @@ pico2-freertos-template/
 ├── src/bridge_protocol.c                 # USB packet parser/commands (no SDK dependencies)
 ├── src/bridge_protocol.h                 # Protocol constants, ops callbacks, state
 ├── docs/bridge-protocol-design.md        # Protocol design and adaptation notes
+├── tools/README.md                       # Host tool build and test guide
 ├── tools/usb_stream.py                   # Reference host loader / STATUS tool (pyserial)
 ├── tools/usb_stream.cpp                  # C++17 host loader (Linux/POSIX)
 ├── cmake/                                # SDK / FreeRTOS import helpers

@@ -166,6 +166,7 @@ class Bridge:
         self.retries = retries
         self.seq = 0
         self.offset = 0
+        self.last_free = 0
 
     def close(self):
         self.ser.close()
@@ -217,6 +218,7 @@ class Bridge:
             pass
         elif rstatus != STATUS_SUCCESS:
             raise ProtocolError("unexpected WRITE_DATA status 0x%02X" % rstatus)
+        self.last_free = free_bytes
         return accepted, stream_accepted, free_bytes, err
 
     def write_data(self, data, chunk=WRITE_MAX_DATA, stall_timeout=None):
@@ -294,6 +296,12 @@ class Bridge:
 
         return self.offset
 
+    def send_chunk(self, data):
+        """Queue one 64-byte-aligned chunk (<= 960 B) completely."""
+        if not data or len(data) % FRAME_BYTES or len(data) > WRITE_MAX_DATA:
+            raise ValueError("chunk must be 64..960 bytes, multiple of 64")
+        self.write_data(data, chunk=len(data))
+
 
 def find_port():
     ports = list(list_ports.comports())
@@ -342,6 +350,90 @@ def load_stdin(bridge, chunk):
         bridge.write_data(pending, chunk=chunk)
 
 
+def print_stream_report(elapsed, status):
+    print("[%8.1fs] used=%u free=%u stage=%u spi=%u zero=%u full=%u "
+          "under=%u crc=%u bad=%u stream=%u off=%u" %
+          (elapsed, status["used"], status["free"], status["stage_ahead"],
+           status["spi_consumed"], status["zero_fill"],
+           status["ring_full_events"], status["underrun_events"],
+           status["checksum_errors"], status["bad_packets"],
+           status["stream_accepted"], status["stream_offset"]),
+          file=sys.stderr, flush=True)
+
+
+def pattern_source(chunk):
+    per_chunk = chunk // FRAME_BYTES
+    frame = 0
+
+    def next_chunk():
+        nonlocal frame
+        block = bytearray(per_chunk * FRAME_BYTES)
+        for i in range(per_chunk):
+            value = (frame + i) & 0xFF
+            block[i * FRAME_BYTES:(i + 1) * FRAME_BYTES] = \
+                bytes([value]) * FRAME_BYTES
+        frame += per_chunk
+        return bytes(block)
+
+    return next_chunk
+
+
+def file_loop_source(stream, chunk):
+    def next_chunk():
+        data = stream.read(chunk)
+        if not data:
+            stream.seek(0)
+            data = stream.read(chunk)
+        if not data:
+            raise ProtocolError("cannot loop an empty file")
+        if len(data) % FRAME_BYTES:
+            data += bytes(FRAME_BYTES - (len(data) % FRAME_BYTES))
+        return data
+
+    return next_chunk
+
+
+def stream_continuous(bridge, next_chunk, chunk, capacity, initial_used,
+                      watermark_ms, report_s, duration_s):
+    """Feed an endless source, keeping the device ring near a target level."""
+    target = max(watermark_ms * 64, chunk) if watermark_ms > 0 else 0
+    if target > capacity:
+        target = capacity
+    used = initial_used
+
+    if target:
+        while used < target:
+            block = next_chunk()
+            bridge.send_chunk(block)
+            used = (capacity - bridge.last_free
+                    if bridge.last_free <= capacity else 0)
+        print("preloaded %u bytes (target %u); streaming continuously" %
+              (used, target), file=sys.stderr, flush=True)
+
+    start = time.monotonic()
+    last_report = start
+    while True:
+        now = time.monotonic()
+        if duration_s > 0 and now - start >= duration_s:
+            break
+        if report_s > 0 and now - last_report >= report_s:
+            status = bridge.status()
+            print_stream_report(now - start, status)
+            used = status["used"]
+            last_report = now
+        if target and used > target:
+            wait_ms = min((used - target) // 64, 100)
+            if wait_ms < 1:
+                wait_ms = 1
+            time.sleep(wait_ms / 1000.0)
+            used = max(0, used - wait_ms * 64)
+            continue
+        block = next_chunk()
+        bridge.send_chunk(block)
+        used = (capacity - bridge.last_free
+                if bridge.last_free <= capacity else 0)
+
+
 def load_pattern(bridge, frames, chunk):
     """Send 64-byte frames; frame N is filled with byte (N & 0xFF)."""
     per_chunk = chunk // FRAME_BYTES
@@ -377,7 +469,15 @@ def main():
     parser.add_argument("--pattern", action="store_true",
                         help="send test frames: frame index N (from 0) is 64 x (N & 0xFF)")
     parser.add_argument("--frames", type=int, default=None,
-                        help="number of frames for --pattern (0 = endless)")
+                        help="number of frames for --pattern (omit or 0 = continuous)")
+    parser.add_argument("--loop", action="store_true",
+                        help="replay the input file continuously")
+    parser.add_argument("--watermark-ms", type=int, default=200,
+                        help="continuous mode target ring level in ms (0 = no throttle)")
+    parser.add_argument("--report", type=float, default=5.0,
+                        help="seconds between status reports in continuous mode (0 = off)")
+    parser.add_argument("--duration", type=float, default=0.0,
+                        help="seconds to stream in continuous mode (0 = until Ctrl-C)")
     parser.add_argument("-s", "--status", action="store_true",
                         help="print device status and exit")
     parser.add_argument("--version", action="store_true",
@@ -402,6 +502,18 @@ def main():
         parser.error("--frames must be >= 0")
     if args.pattern and args.file:
         parser.error("--pattern does not take a file")
+    if args.loop and args.pattern:
+        parser.error("--loop cannot be combined with --pattern")
+    if args.loop and not args.file:
+        parser.error("--loop requires a file")
+    if args.loop and args.file == "-":
+        parser.error("--loop requires a seekable file")
+    if args.watermark_ms < 0:
+        parser.error("--watermark-ms must be >= 0")
+    if args.report < 0:
+        parser.error("--report must be >= 0")
+    if args.duration < 0:
+        parser.error("--duration must be >= 0")
 
     port = args.port or find_port()
     if args.port is None:
@@ -429,13 +541,35 @@ def main():
         print("device stream offset 0x%08X, ring %u free" %
               (bridge.offset, status["free"]), file=sys.stderr)
 
-        if args.pattern:
-            load_pattern(bridge, 0 if args.frames is None else args.frames,
-                         args.chunk)
-        elif args.file == "-":
-            load_stdin(bridge, args.chunk)
-        else:
-            load_file(bridge, args.file, args.chunk)
+        continuous_pattern = (args.pattern and
+                              (args.frames is None or args.frames == 0))
+        continuous_file = bool(args.file) and args.loop
+
+        try:
+            if continuous_pattern:
+                stream_continuous(
+                    bridge, pattern_source(args.chunk), args.chunk,
+                    status["capacity"], status["used"], args.watermark_ms,
+                    args.report, args.duration)
+            elif continuous_file:
+                with open(args.file, "rb") as stream:
+                    stream_continuous(
+                        bridge, file_loop_source(stream, args.chunk),
+                        args.chunk, status["capacity"], status["used"],
+                        args.watermark_ms, args.report, args.duration)
+            elif args.pattern:
+                load_pattern(bridge, args.frames, args.chunk)
+            elif args.file == "-":
+                load_stdin(bridge, args.chunk)
+            else:
+                load_file(bridge, args.file, args.chunk)
+        except KeyboardInterrupt:
+            print("\ninterrupted", file=sys.stderr)
+            try:
+                print_status(bridge.status())
+            except Exception:
+                pass
+            return
 
         print_status(bridge.status())
     finally:
