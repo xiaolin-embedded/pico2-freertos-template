@@ -411,7 +411,7 @@ static void bridge_hardware_init(void) {
     gpio_pull_up(BRIDGE_PIN_SCK);
 #endif
 
-    spi_init(BRIDGE_SPI, 1000 * 1000);
+    spi_init(BRIDGE_SPI, 5 * 1000 * 1000);
     spi_set_slave(BRIDGE_SPI, true);
     spi_set_format(BRIDGE_SPI, 8, BRIDGE_SPI_CPOL, BRIDGE_SPI_CPHA, SPI_MSB_FIRST);
 
